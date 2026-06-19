@@ -1,0 +1,17 @@
+[build-system]
+requires = ["flit_core >=3.2,<4"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "fastvideo-faaris"
+version = "0.1.0"
+description = "A blazing fast video editing library wrapping FFmpeg native filters."
+readme = "README.md"
+authors = [{name = "Faaris"}]
+classifiers = ["Programming Language :: Python :: 3"]
+dependencies = [
+    "ffmpeg-python>=0.2.0"
+]
+
+[tool.flit.module]
+name = "fastvideo"
