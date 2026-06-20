@@ -4,7 +4,7 @@ build-backend = "flit_core.buildapi"
 
 [project]
 name = "core-flux"
-version = "0.2.1"
+version = "0.2.4"
 description = "A blazing fast video editing library wrapping FFmpeg native filters."
 readme = "README.md"
 authors = [{name = "Faaris"}]
