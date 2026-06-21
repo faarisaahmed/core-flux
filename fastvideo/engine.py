@@ -1,130 +1,151 @@
 import ffmpeg
 import time
 
-class FastVideo:
+class VideoLayer:
     def __init__(self, input_path):
-        """Initialize the toolkit and safely detect if audio exists."""
+        """Represents an independent video clip piece that can be positioned and styled."""
         self.input_path = input_path
+        
         input_node = ffmpeg.input(input_path)
         self.video_stream = input_node.video
-
-        # Check if the file actually contains an audio stream
+        
+        # Check if the file has audio, if not safe-skip it
         try:
             probe = ffmpeg.probe(input_path)
             has_audio = any(stream['codec_type'] == 'audio' for stream in probe['streams'])
             self.audio_stream = input_node.audio if has_audio else None
         except Exception:
-            # Fallback if probe fails or file is corrupted
             self.audio_stream = None
 
-    # --- EXISTING METHODS ---
+        self.x_pos = 0
+        self.y_pos = 0
+
+    def set_position(self, x, y):
+        self.x_pos = x
+        self.y_pos = y
+        return self
 
     def resize(self, width, height):
-        """Resizes the video using FFmpeg's native scale filter."""
         self.video_stream = self.video_stream.filter('scale', width, height)
         return self
 
-    def adjust_colors(self, contrast=1.0, brightness=0.0, saturation=1.0):
-        """Adjusts video contrast, brightness, and saturation."""
-        self.video_stream = self.video_stream.filter(
-            'eq', 
-            contrast=contrast, 
-            brightness=brightness, 
-            saturation=saturation
-        )
-        return self
-
-    def trim(self, start_time, end_time):
-        """Cuts the video and safely cuts audio only if it exists."""
-        self.video_stream = self.video_stream.filter('trim', start=start_time, end=end_time).filter('setpts', 'PTS-STARTPTS')
-        
-        # ONLY apply audio filters if an audio stream actually exists!
-        if self.audio_stream is not None:
-            self.audio_stream = self.audio_stream.filter('atrim', start=start_time, end=end_time).filter('asetpts', 'PTS-STARTPTS')
-        return self
-
-    def fade_out(self, start_fade, duration=1.0):
-        """Smoothly fades the video to black."""
-        self.video_stream = self.video_stream.filter('fade', type='out', start_time=start_fade, duration=duration)
-        return self
-
-    # --- NEW MOVIEPY-STYLE RECIPES ---
-
     def crop(self, x1, y1, width, height):
-        """Crops a specific region of the video."""
-        self.video_stream = self.video_stream.filter('crop', w=width, h=height, x=x1, y=y1)
+        self.video_stream = self.video_stream.filter('crop', width, height, x1, y1)
         return self
 
-    def rotate(self, angle):
-        """Rotates the video. angle can be 90, 180, or 270 degrees."""
-        if angle == 90:
-            self.video_stream = self.video_stream.filter('transpose', 1)
-        elif angle == 180:
-            self.video_stream = self.video_stream.filter('transpose', 2).filter('transpose', 2)
-        elif angle == 270:
-            self.video_stream = self.video_stream.filter('transpose', 2)
-        return self
-
-    def speedx(self, factor):
-        """Speeds up or slows down both video and audio by a factor."""
-        self.video_stream = self.video_stream.filter('setpts', f'{1/factor}*PTS')
-        
-        # Guard the audio stream filter
-        if self.audio_stream is not None:
-            self.audio_stream = self.audio_stream.filter('atempo', factor)
+    def adjust_colors(self, contrast=1.0, brightness=0.0, saturation=1.0):
+        self.video_stream = self.video_stream.filter('eq', contrast=contrast, brightness=brightness, saturation=saturation)
         return self
 
     def blackwhite(self):
-        """Converts the video to black and white using the hue/saturation filter."""
         self.video_stream = self.video_stream.filter('hue', s=0)
         return self
 
     def with_volume_scaled_to(self, factor):
-        """Adjusts audio volume cleanly if audio exists."""
+        """Adjusts the native audio volume embedded inside this video layer."""
         if self.audio_stream is not None:
             self.audio_stream = self.audio_stream.filter('volume', volume=factor)
         return self
 
-    def without_audio(self):
-        """Removes the audio stream entirely from the graph."""
-        self.audio_stream = None
+    def mute(self):
+        """Completely silences this video layer's embedded audio track."""
+        return self.with_volume_scaled_to(0.0)
+
+    def fade_in(self, start_time, duration=1.0):
+        """Smoothly fades BOTH video visuals and native audio in from black/silence."""
+        self.video_stream = self.video_stream.filter('fade', type='in', start_time=start_time, duration=duration)
+        if self.audio_stream is not None:
+            self.audio_stream = self.audio_stream.filter('afade', type='in', start_time=start_time, duration=duration)
         return self
 
-    def replace_audio(self, new_audio_path):
-        """Replaces the current audio track with an external audio file."""
-        new_audio_node = ffmpeg.input(new_audio_path)
-        self.audio_stream = new_audio_node.audio
+    def fade_out(self, start_fade, duration=1.0):
+        """Smoothly fades BOTH video visuals and native audio out to black/silence."""
+        self.video_stream = self.video_stream.filter('fade', type='out', start_time=start_fade, duration=duration)
+        if self.audio_stream is not None:
+            self.audio_stream = self.audio_stream.filter('afade', type='out', start_time=start_fade, duration=duration)
         return self
 
-    # --- RENDER ENGINE ---
+    def trim(self, start, end):
+        self.video_stream = self.video_stream.filter('trim', start=start, end=end).filter('setpts', 'PTS-STARTPTS')
+        if self.audio_stream is not None:
+            self.audio_stream = self.audio_stream.filter('atrim', start=start, end=end).filter('asetpts', 'PTS-STARTPTS')
+        return self
+
+
+class AudioLayer:
+    def __init__(self, input_path):
+        """Represents a standalone secondary audio layer (like background tracks)."""
+        self.input_path = input_path
+        self.audio_stream = ffmpeg.input(input_path).audio
+
+    def with_volume_scaled_to(self, factor):
+        self.audio_stream = self.audio_stream.filter('volume', volume=factor)
+        return self
+
+    def fade_out(self, start_time, duration=1.0):
+        self.audio_stream = self.audio_stream.filter('afade', type='out', start_time=start_time, duration=duration)
+        return self
+
+    def trim(self, start, end):
+        self.audio_stream = self.audio_stream.filter('atrim', start=start, end=end).filter('asetpts', 'PTS-STARTPTS')
+        return self
+
+
+class Composition:
+    def __init__(self, layers=None, audio_tracks=None):
+        self.layers = layers if layers is not None else []
+        self.audio_tracks = audio_tracks if audio_tracks is not None else []
 
     def render(self, output_path, format_type='video'):
-        """
-        Fuses the stream together and exports it.
-        format_type can be 'video', 'gif', or 'audio'.
-        """
-        # Guard against trying to extract audio from a silent video track
-        if format_type == 'audio' and self.audio_stream is None:
-            raise ValueError("❌ Core-Flux Error: Cannot extract audio from a source file with no audio stream!")
+        if not self.layers and format_type != 'audio':
+            raise ValueError("❌ Core-Flux Error: Cannot render without any VideoLayers!")
 
-        print(f"🚀 CORE-FLUX: Sending graph to FFmpeg... Rendering {output_path}")
+        print(f"🚀 CORE-FLUX [v0.3.2b1]: Rendering layout graph to {output_path}")
         start_clock = time.time()
         
-        # Build the final output mapping based on format type
+        # 1. COMPOSE VIDEO LAYERS
+        if format_type != 'audio':
+            base = self.layers[0].video_stream
+            for overlay_layer in self.layers[1:]:
+                base = ffmpeg.overlay(base, overlay_layer.video_stream, x=overlay_layer.x_pos, y=overlay_layer.y_pos)
+            final_video = base
+            
+        # 2. COMPOSE AUDIO TRACKS
+        all_audio_streams = []
+        for layer in self.layers:
+            if layer.audio_stream is not None:
+                all_audio_streams.append(layer.audio_stream)
+        for track in self.audio_tracks:
+            all_audio_streams.append(track.audio_stream)
+
+        final_audio = None
+        if all_audio_streams:
+            if len(all_audio_streams) > 1:
+                final_audio = ffmpeg.filter(all_audio_streams, 'amix', inputs=len(all_audio_streams))
+            else:
+                final_audio = all_audio_streams[0]
+
+        # 3. BUILD OUTPUT SPECIFICS BASED ON FORMAT TYPE
         output_args = {}
-        if format_type == 'gif':
-            # Optimize filters for a clean, non-grainy GIF output using a custom palette
-            split_stream = self.video_stream.split()
-            palette = split_stream[0].filter('palettegen')
-            self.video_stream = ffmpeg.filter([split_stream[1], palette], 'paletteuse')
-            streams = [self.video_stream]
-        elif format_type == 'audio':
-            streams = [self.audio_stream]
+        streams = []
+
+        if format_type == 'audio':
+            if not all_audio_streams:
+                raise ValueError("❌ Core-Flux Error: No audio streams detected for format_type='audio'")
+            streams = [final_audio]
             output_args.update({'acodec': 'mp3' if output_path.endswith('.mp3') else 'aac'})
-        else: # Standard Video
-            streams = [self.video_stream]
-            if self.audio_stream is not None:
-                streams.append(self.audio_stream)
+        
+        elif format_type == 'gif':
+            # Create high-fidelity color palette optimization for high quality GIFs
+            palette = final_video.filter('palettegen')
+            final_video = ffmpeg.filter([final_video, palette], 'paletteuse')
+            streams = [final_video]
+            output_args.update({'f': 'gif'})
+            
+        else: # Default: 'video' (MP4)
+            streams = [final_video]
+            if final_audio is not None:
+                streams.append(final_audio)
             output_args.update({
                 'vcodec': 'libx264',   
                 'acodec': 'aac',       
@@ -134,6 +155,4 @@ class FastVideo:
         output = ffmpeg.output(*streams, output_path, **output_args)
         output.overwrite_output().run()
         
-        time_taken = time.time() - start_clock
-        print("✅ Render Complete!")
-        print(f"⏱️ Execution Time: {time_taken:.2f} seconds")
+        print(f"✅ Render Complete in {time.time() - start_clock:.2f} seconds!")

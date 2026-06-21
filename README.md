@@ -1,145 +1,234 @@
 # core-flux (Concisely Optimized Render Engine - FFmpeg Linear User Xtension)
-A high-performance video editing library built entirely on top of native FFmpeg filters. By bypassing Python-level pixel manipulation and compiling operations directly into a single native filter graph, `core-flux` runs at maximum speed with a beautiful, chainable API.
+
+A high-performance video editing and compositing library built entirely on top of native FFmpeg complex filtergraphs. By bypassing Python-level pixel manipulation and compiling layers directly into a single native filter graph, `core-flux` runs at maximum speed with a beautiful, modern API.
 
 ---
 
 ## Installation
+
+### Stable Channel (Compositing Layer Engine v0.3.x)
+
 ```bash
 pip install core-flux
 ```
 
-## Quick Start
-```python
-from fastvideo import FastVideo
+### Legacy Channel (Linear Engine v0.2.x)
 
-# Trim, resize, adjust colors, and render instantly
-video = FastVideo("input.mp4")
-video.trim(2, 12).resize(1280, 720).adjust_colors(contrast=1.2, saturation=1.5).render("output.mp4")
+If you need the older linear pipeline structure, lock your installation to the 0.2 series:
+
+```bash
+pip install core-flux<0.3.0
 ```
 
+---
+
+## Quick Start
+
+Create independent video and audio pieces, layer them onto a master canvas, change volume, add fades, and compile instantly:
+
+```python
+from fastvideo import VideoLayer, AudioLayer, Composition
+
+# 1. Initialize and configure independent pieces
+background = VideoLayer("bg.mp4").resize(1920, 1080).fade_out(start_fade=10.0)
+facecam = (VideoLayer("gamer_cam.mp4")
+           .resize(400, 300)
+           .set_position(x=50, y=50)
+           .mute())  # Mute native webcam background noise
+
+# 2. Add an independent audio track
+bg_music = AudioLayer("lofi_beats.mp3").with_volume_scaled_to(0.2)
+
+# 3. Stack layers and tracks onto the composition timeline canvas
+timeline = Composition(
+    layers=[background, facecam],
+    audio_tracks=[bg_music]
+)
+
+# 4. Render directly to a native FFmpeg stream
+timeline.render("gaming_edit.mp4")
+```
+
+---
+
 ## Features
-- **Chainable API** — Compose operations fluently in a single, readable expression.
-- **FFmpeg-Native Speed** — Zero Python processing bottleneck; your timeline is compiled into a native C-level graph.
-- **Audio Control** — Easily scale, replace, or remove audio streams.
-- **Silent-File Safe** — Audio filters are automatically skipped when no audio stream is detected.
+
+- **Compositing Canvas** — Treat video and audio tracks as individual layers that can be stacked, sized, and placed anywhere.
+- **FFmpeg-Native Speed** — Zero Python processing bottleneck; your timeline is compiled into a native C-level complex graph.
+- **Granular Audio Routing** — Scale or completely mute individual video stream audio tracks independently before final mixing.
+- **Cinematic Transitions** — Native hardware-accelerated video and audio fades.
+- **Audio Mixing** — Automatically mixes all distinct audio tracks using FFmpeg's `amix` filter.
 
 ---
 
 ## API Reference
 
-### `FastVideo(input_path: str)`
-Load a media file for editing. Automatically detects whether the file contains an audio stream.
+### `VideoLayer(input_path: str)`
+
+Represents an independent video clip layer. Automatically detects whether the file contains native audio.
+
 ```python
-video = FastVideo("input.mp4")
+clip = VideoLayer("input.mp4")
 ```
 
----
+#### `.set_position(x: int, y: int)`
 
-### Video Operations
+Sets the pixel coordinates where the layer will sit relative to the base canvas background.
+
+```python
+clip.set_position(x=100, y=50)
+```
 
 #### `.resize(width: int, height: int)`
-Scale the video to the given dimensions in pixels.
+
+Scale this specific layer to the given dimensions in pixels.
+
 ```python
-video.resize(1920, 1080)
+clip.resize(1280, 720)
 ```
 
 #### `.crop(x1: int, y1: int, width: int, height: int)`
-Crop a rectangular region of the video, starting from the top-left corner `(x1, y1)`.
-```python
-video.crop(100, 50, 1280, 720)
-```
 
-#### `.rotate(angle: int)`
-Rotate the video. Supported angles are `90`, `180`, and `270` degrees.
+Crop a rectangular region of the layer, starting from the top-left corner `(x1, y1)`.
+
 ```python
-video.rotate(90)
+clip.crop(100, 50, 640, 480)
 ```
 
 #### `.trim(start_time: float, end_time: float)`
-Cut the video (and audio, if present) between two timestamps in seconds.
-```python
-video.trim(0, 10)
-```
 
-#### `.fade_out(start_fade: float, duration: float = 1.0)`
-Add a smooth fade-to-black effect starting at `start_fade` seconds.
+Cut this layer between two timestamps in seconds. Handles internal audio timing safely if audio is present.
+
 ```python
-video.fade_out(start_fade=8.0, duration=2.0)
+clip.trim(0, 10)
 ```
 
 #### `.adjust_colors(contrast: float = 1.0, brightness: float = 0.0, saturation: float = 1.0)`
-Adjust contrast, brightness, and saturation. Values above `1.0` increase the effect; below `1.0` decrease it.
+
+Adjust contrast, brightness, and saturation for this layer.
+
 ```python
-video.adjust_colors(contrast=1.2, saturation=1.5)
+clip.adjust_colors(contrast=1.2, saturation=1.5)
 ```
 
 #### `.blackwhite()`
-Convert the video to black and white.
+
+Convert this layer to black and white.
+
 ```python
-video.blackwhite()
+clip.blackwhite()
 ```
-
-#### `.speedx(factor: float)`
-Speed up or slow down both video and audio by a multiplier. `2.0` is double speed; `0.5` is half speed.
-```python
-video.speedx(1.5)
-```
-
----
-
-### Audio Operations
 
 #### `.with_volume_scaled_to(factor: float)`
-Scale the audio volume. `0.5` halves it; `2.0` doubles it. No-op if the source has no audio.
+
+Scale the video's embedded native audio stream volume. `0.5` halves volume; `2.0` doubles it.
+
 ```python
-video.with_volume_scaled_to(0.5)
+clip.with_volume_scaled_to(0.5)
 ```
 
-#### `.without_audio()`
-Remove the audio stream entirely from the output.
+#### `.mute()`
+
+Completely silence the embedded native audio stream on this video layer.
+
 ```python
-video.without_audio()
+clip.mute()
 ```
 
-#### `.replace_audio(new_audio_path: str)`
-Swap the current audio track with an external audio file.
+#### `.fade_in(start_time: float, duration: float = 1.0)`
+
+Smoothly fades both video visuals and its native audio in from black/silence.
+
 ```python
-video.replace_audio("soundtrack.mp3")
+clip.fade_in(start_time=0.0, duration=2.0)
+```
+
+#### `.fade_out(start_fade: float, duration: float = 1.0)`
+
+Smoothly fades both video visuals and its native audio out to black/silence.
+
+```python
+clip.fade_out(start_fade=13.5, duration=1.5)
 ```
 
 ---
 
-### Rendering
+### `AudioLayer(input_path: str)`
+
+Represents an independent secondary audio track (e.g., sound effects, background music).
+
+```python
+music = AudioLayer("music.mp3")
+```
+
+#### `.with_volume_scaled_to(factor: float)`
+
+Scale the audio volume. `0.5` halves volume; `2.0` doubles it.
+
+```python
+music.with_volume_scaled_to(0.5)
+```
+
+#### `.fade_out(start_time: float, duration: float = 1.0)`
+
+Smoothly fades the audio track out to complete silence.
+
+```python
+music.fade_out(start_time=45.0, duration=2.0)
+```
+
+#### `.trim(start_time: float, end_time: float)`
+
+Cut the audio track between two timestamps in seconds.
+
+```python
+music.trim(15, 45)
+```
+
+---
+
+### `Composition(layers: list = None, audio_tracks: list = None)`
+
+The central timeline manager. The first object in `layers` behaves as the background video canvas; subsequent layers are overlaid sequentially on top.
+
+```python
+timeline = Composition(layers=[bg, overlay_1], audio_tracks=[music])
+```
 
 #### `.render(output_path: str, format_type: str = 'video')`
-Compile the filter graph and write the result to disk.
+
+Compiles all layer blocks into an optimal FFmpeg filtergraph and writes the result to disk.
 
 The `format_type` parameter controls the output mode:
 
 | Value | Description |
-|---|---|
-| `'video'` | Standard video with audio (default). Encodes with H.264 + AAC. |
-| `'gif'` | Animated GIF with palette optimization for clean output. |
-| `'audio'` | Extracts the audio stream only. Outputs MP3 or AAC based on file extension. |
+|-------|-------------|
+| `'video'` | Standard multi-layer video with mixed audio tracks (default). Encodes with H.264 + AAC. |
+| `'gif'` | Animated GIF output optimized with a custom high-fidelity color palette. |
+| `'audio'` | Compiles and mixes audio streams only into an MP3 or AAC file. |
 
 ```python
-# Standard video
-video.render("output.mp4")
+# Render standard multi-layer video
+timeline.render("output.mp4")
 
-# Animated GIF
-video.render("output.gif", format_type='gif')
+# Render high-fidelity GIF
+timeline.render("output.gif", format_type='gif')
 
-# Audio only
-video.render("output.mp3", format_type='audio')
+# Render audio compilation only
+timeline.render("master_mix.mp3", format_type='audio')
 ```
 
-> **Note:** Passing `format_type='audio'` on a source file with no audio stream raises a `ValueError`.
+> **Note:** Attempting to render with `format_type='audio'` when no tracks or layer audio streams are active raises a `ValueError`.
 
 ---
 
 ## Requirements
+
 - Python 3.8+
-- FFmpeg installed and available on your `PATH`
+- FFmpeg installed and available on your system `PATH`
+
+---
 
 ## License
+
 MIT
