@@ -25,6 +25,7 @@ from core_flux import (
 )
 from core_flux.engine import format_from_path
 from core_flux.probe import has_filter
+from core_flux.text import pillow_available
 
 
 def duration_of(path):
@@ -331,18 +332,48 @@ def test_audio_layer_has_fade_in(media, out):
     assert "afade" in command
 
 
-@pytest.mark.skipif(has_filter("drawtext"), reason="this build has drawtext")
-def test_add_text_reports_missing_filter(media):
-    with pytest.raises(FilterUnavailableError):
-        VideoLayer(media["bg"]).add_text("hello")
-
-
-@pytest.mark.skipif(not has_filter("drawtext"), reason="build lacks drawtext")
+@pytest.mark.skipif(
+    not (has_filter("drawtext") or pillow_available()),
+    reason="neither drawtext nor Pillow is available",
+)
 def test_add_text_renders(media, out):
+    """Works via drawtext, or via the Pillow overlay fallback."""
     path = render(Composition(
         layers=[VideoLayer(media["bg"]).resize(320, 180).add_text("hi", size=24)]
     ), out("text.mp4"))
     assert duration_of(path) > 0
+
+
+@pytest.mark.skipif(has_filter("drawtext"), reason="this build has drawtext")
+@pytest.mark.skipif(not pillow_available(), reason="Pillow not installed")
+def test_add_text_uses_pillow_fallback(media, out):
+    """Without drawtext the caption becomes a PNG overlay, not an error."""
+    command = Composition(
+        layers=[VideoLayer(media["bg"]).resize(320, 180).add_text("hi")]
+    ).get_command(out("t.mp4"))
+    assert "drawtext" not in command
+    assert "overlay" in command and ".png" in command
+
+
+def test_add_text_without_drawtext_or_pillow_explains_both(media, monkeypatch):
+    import core_flux.engine as engine
+
+    monkeypatch.setattr(engine, "has_filter", lambda name: False)
+    monkeypatch.setattr(engine, "pillow_available", lambda: False)
+    with pytest.raises(FilterUnavailableError) as excinfo:
+        VideoLayer(media["bg"]).add_text("hello")
+    message = str(excinfo.value)
+    assert "core-flux[text]" in message and "drawtext" in message
+
+
+def test_pillow_fallback_needs_a_known_size(media, monkeypatch):
+    import core_flux.engine as engine
+
+    monkeypatch.setattr(engine, "has_filter", lambda name: False)
+    layer = VideoLayer(media["bg"])
+    layer._width = None
+    with pytest.raises(CoreFluxError):
+        layer.add_text("hello")
 
 
 # ---------------------------------------------------------------- composition

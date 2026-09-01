@@ -13,6 +13,11 @@ Two workloads are measured:
                together; it exists to show core-flux adds no overhead.
   composite  - overlay a second clip, mute it, mix in a music bed and fade
                out. This is the workload the library is actually built for.
+  transition - join three segments with crossfades. Both libraries support
+               this, so it is a like-for-like comparison.
+
+core-flux is measured twice: with the default software encoder, and with
+hardware=True where a hardware H.264 encoder is available.
 """
 
 import os
@@ -94,6 +99,47 @@ def moviepy_transcode(output):
 
 # ------------------------------------------------------------------ composite
 
+def flux_transition(output):
+    from core_flux import Composition, VideoLayer, crossfade
+
+    clips = [VideoLayer(SAMPLE).trim(0, 5),
+             VideoLayer(OVERLAY).trim(0, 5),
+             VideoLayer(SAMPLE).trim(5, 10)]
+    joined = crossfade(clips, duration=1.0, width=1280, height=720, fps=30)
+    Composition(layers=[joined]).render(output, quiet=True)
+
+
+def ffmpeg_transition(output):
+    ffmpeg([
+        "-i", SAMPLE, "-i", OVERLAY,
+        "-filter_complex",
+        "[0:v]trim=0:5,setpts=PTS-STARTPTS,scale=1280:720,setsar=1,fps=30[a];"
+        "[1:v]trim=0:5,setpts=PTS-STARTPTS,scale=1280:720,setsar=1,fps=30[b];"
+        "[0:v]trim=5:10,setpts=PTS-STARTPTS,scale=1280:720,setsar=1,fps=30[c];"
+        "[a][b]xfade=transition=fade:duration=1:offset=4[ab];"
+        "[ab][c]xfade=transition=fade:duration=1:offset=8[v]",
+        "-map", "[v]", "-an",
+        "-c:v", "libx264", "-crf", "23", "-pix_fmt", "yuv420p", output,
+    ])
+
+
+def moviepy_transition(output):
+    from moviepy import VideoFileClip, concatenate_videoclips
+    from moviepy.video.fx import CrossFadeIn, Resize
+
+    def seg(path, start, end):
+        return (VideoFileClip(path).subclipped(start, end)
+                .with_effects([Resize(new_size=(1280, 720))])
+                .without_audio())
+
+    clips = [seg(SAMPLE, 0, 5), seg(OVERLAY, 0, 5), seg(SAMPLE, 5, 10)]
+    faded = [clips[0]] + [c.with_effects([CrossFadeIn(1.0)]) for c in clips[1:]]
+    final = concatenate_videoclips(faded, padding=-1.0, method="compose")
+    final.write_videofile(output, codec="libx264", audio=False, logger=None)
+    for clip in clips + [final]:
+        clip.close()
+
+
 def flux_composite(output):
     from core_flux import AudioLayer, Composition, VideoLayer
 
@@ -145,16 +191,43 @@ def moviepy_composite(output):
         clip.close()
 
 
+def hardware_variant(fn):
+    """Run a core-flux workload with hardware encoding enabled."""
+    def wrapped(output):
+        import core_flux.engine as engine
+
+        original = engine.Composition.render
+
+        def patched(self, path, **kwargs):
+            kwargs.setdefault("hardware", True)
+            return original(self, path, **kwargs)
+
+        engine.Composition.render = patched
+        try:
+            fn(output)
+        finally:
+            engine.Composition.render = original
+    return wrapped
+
+
 WORKLOADS = [
     ("transcode (1080p -> 720p, H.264/AAC)", {
         "ffmpeg": ffmpeg_transcode,
         "core-flux": flux_transcode,
+        "core-flux+hw": hardware_variant(flux_transcode),
         "moviepy": moviepy_transcode,
     }),
     ("composite (overlay + audio mix + fade)", {
         "ffmpeg": ffmpeg_composite,
         "core-flux": flux_composite,
+        "core-flux+hw": hardware_variant(flux_composite),
         "moviepy": moviepy_composite,
+    }),
+    ("transition (3 clips joined by crossfades)", {
+        "ffmpeg": ffmpeg_transition,
+        "core-flux": flux_transition,
+        "core-flux+hw": hardware_variant(flux_transition),
+        "moviepy": moviepy_transition,
     }),
 ]
 
@@ -212,8 +285,12 @@ def main():
                      statistics.stdev(data) if len(data) > 1 else 0.0))
 
         if "moviepy" in results and "core-flux" in results:
-            ratio = statistics.mean(results["moviepy"]) / statistics.mean(results["core-flux"])
+            reference = statistics.mean(results["moviepy"])
+            ratio = reference / statistics.mean(results["core-flux"])
             print("\n  core-flux is %.2fx the speed of MoviePy on this workload." % ratio)
+            if "core-flux+hw" in results:
+                hw_ratio = reference / statistics.mean(results["core-flux+hw"])
+                print("  With hardware encoding: %.2fx." % hw_ratio)
 
     print("\n" + "-" * 75)
 

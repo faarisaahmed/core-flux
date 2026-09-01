@@ -1,12 +1,14 @@
 """core-flux: a fast, layer-based video editing library built on FFmpeg filtergraphs."""
 
 from .engine import (
+    TRANSITIONS,
     AudioLayer,
     ColorLayer,
     Composition,
     ImageLayer,
     VideoLayer,
     concatenate,
+    crossfade,
 )
 from .errors import (
     CoreFluxError,
@@ -18,7 +20,7 @@ from .errors import (
 )
 from .probe import inspect_media
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "VideoLayer",
@@ -27,6 +29,8 @@ __all__ = [
     "ColorLayer",
     "Composition",
     "concatenate",
+    "crossfade",
+    "TRANSITIONS",
     "inspect_media",
     "CoreFluxError",
     "FFmpegNotFoundError",

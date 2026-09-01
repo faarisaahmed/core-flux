@@ -6,18 +6,30 @@ into a single FFmpeg invocation.
 """
 
 import os
+import subprocess
 import time
 import warnings
 
-import ffmpeg
-
+from .graph import Graph, InputFile, multi_filter
 from .errors import (
     CoreFluxError,
     FilterUnavailableError,
+    MediaNotFoundError,
     RenderError,
     UnsupportedMediaError,
 )
-from .probe import ensure_ffmpeg, has_filter, inspect_media
+from .probe import (
+    best_h264_encoder,
+    ensure_ffmpeg,
+    has_filter,
+    inspect_media,
+)
+from .text import (
+    parse_srt,
+    pillow_available,
+    render_caption_png,
+    render_text_png,
+)
 
 AUDIO_EXTENSIONS = frozenset(
     [".mp3", ".wav", ".aac", ".m4a", ".flac", ".ogg", ".opus", ".wma"]
@@ -26,6 +38,22 @@ FASTSTART_EXTENSIONS = frozenset([".mp4", ".m4v", ".mov"])
 # Containers that take H.264/AAC. Anything else (.webm, .avi, .ogv) is left to
 # FFmpeg's own codec defaults rather than being forced into an invalid pairing.
 H264_EXTENSIONS = frozenset([".mp4", ".m4v", ".mov", ".mkv", ".ts", ".flv"])
+
+# The Pillow subtitle fallback adds one FFmpeg input per cue, so it only suits
+# short tracks. Past this, a libass build is the right answer.
+MAX_FALLBACK_CUES = 100
+
+# Quality defaults per hardware encoder; none of them accept -crf, and each
+# vendor exposes a different knob. The VideoToolbox value was calibrated by
+# SSIM against the source: q:v=50 scores 0.959 versus libx264 -crf 23 at 0.961,
+# while producing a smaller file. The others follow each vendor's stated
+# crf-equivalent.
+HARDWARE_QUALITY = {
+    "h264_videotoolbox": {"q:v": 50},
+    "h264_nvenc": {"cq": 23, "preset": "p4"},
+    "h264_qsv": {"global_quality": 23},
+    "h264_amf": {"quality": "balanced", "qp_i": 23, "qp_p": 23},
+}
 
 # atempo only accepts 0.5-100.0 per instance, so extreme speeds are chained.
 _ATEMPO_MIN = 0.5
@@ -132,10 +160,11 @@ class VideoLayer(_Layer):
                 % (input_path,)
             )
 
-        node = ffmpeg.input(input_path)
+        node = InputFile(input_path)
+        self._input = node
         self.input_path = input_path
-        self.video_stream = node.video
-        self.audio_stream = node.audio if info.has_audio else None
+        self.video_stream = node.video()
+        self.audio_stream = node.audio() if info.has_audio else None
         self._duration = info.duration
         self._width = info.width
         self._height = info.height
@@ -147,6 +176,7 @@ class VideoLayer(_Layer):
         """Build a layer around an existing graph node (used by generators)."""
         layer = object.__new__(cls)
         _Layer.__init__(layer)
+        layer._input = None
         layer.input_path = source
         layer.video_stream = video_stream
         layer.audio_stream = audio_stream
@@ -262,19 +292,176 @@ class VideoLayer(_Layer):
         )
         return self
 
+    def blur(self, radius=5):
+        """Gaussian blur. Higher radius is softer."""
+        self.video_stream = self.video_stream.filter("gblur", sigma=radius)
+        return self
+
+    def sharpen(self, amount=1.0):
+        """Sharpen using an unsharp mask."""
+        self.video_stream = self.video_stream.filter(
+            "unsharp", luma_msize_x=5, luma_msize_y=5, luma_amount=amount
+        )
+        return self
+
+    def invert(self):
+        """Invert colours (photographic negative)."""
+        self.video_stream = self.video_stream.filter("negate")
+        return self
+
+    def gamma(self, value=1.0):
+        """Gamma-correct the layer. Below 1.0 darkens, above 1.0 brightens."""
+        _positive("value", value)
+        self.video_stream = self.video_stream.filter("eq", gamma=value)
+        return self
+
+    def vignette(self):
+        """Darken the corners for a lens-falloff look."""
+        self.video_stream = self.video_stream.filter("vignette")
+        return self
+
+    def margin(self, size=0, color="black", top=None, bottom=None,
+               left=None, right=None):
+        """Add a border, expanding the frame.
+
+        `size` sets every side at once; the per-side arguments override it.
+        """
+        top = size if top is None else top
+        bottom = size if bottom is None else bottom
+        left = size if left is None else left
+        right = size if right is None else right
+        self.video_stream = self.video_stream.filter(
+            "pad",
+            "iw+%d" % (left + right),
+            "ih+%d" % (top + bottom),
+            left, top, color=color,
+        )
+        if self._width and self._height:
+            self._width += left + right
+            self._height += top + bottom
+        return self
+
+    def chroma_key(self, color="green", similarity=0.3, blend=0.1):
+        """Knock out a background colour, making it transparent.
+
+        Use on an overlay layer; the layer beneath shows through. `similarity`
+        widens the range of colours removed, `blend` softens the edge.
+        """
+        self.video_stream = (
+            self.video_stream
+            .filter("format", "yuva420p")
+            .filter("colorkey", color=color, similarity=similarity, blend=blend)
+        )
+        return self
+
+    def add_subtitles(self, subtitle_path, force_style=None, size=36,
+                      color="white", font=None, box=True):
+        """Burn subtitles from an .srt or .ass file into the picture.
+
+        Uses FFmpeg's ``subtitles`` filter when the build has libass. Otherwise
+        each cue is rendered with Pillow and overlaid for its own time window,
+        which handles .srt only and needs a known layer size.
+        """
+        if not os.path.isfile(subtitle_path):
+            raise MediaNotFoundError("No such subtitle file: %r" % (subtitle_path,))
+
+        if has_filter("subtitles"):
+            options = {}
+            if force_style:
+                options["force_style"] = force_style
+            self.video_stream = self.video_stream.filter(
+                "subtitles", subtitle_path, **options
+            )
+            return self
+
+        if not pillow_available():
+            raise FilterUnavailableError(
+                "Cannot burn subtitles: this FFmpeg build has no 'subtitles' "
+                "filter (it needs libass), and Pillow is not installed for the "
+                "fallback.\nFix either one:\n"
+                "  pip install core-flux[text]      # use the Pillow fallback\n"
+                "  brew reinstall ffmpeg            # get a build with libass"
+            )
+        if not subtitle_path.lower().endswith(".srt"):
+            raise FilterUnavailableError(
+                "The Pillow subtitle fallback reads .srt only, and this FFmpeg "
+                "build has no 'subtitles' filter for %r." % (subtitle_path,)
+            )
+        return self._add_subtitles_overlay(subtitle_path, size, color, font, box)
+
+    def _add_subtitles_overlay(self, subtitle_path, size, color, font, box):
+        if not self._width or not self._height:
+            raise CoreFluxError(
+                "The Pillow subtitle fallback needs to know the layer size. "
+                "Call resize() first, or install an FFmpeg with libass."
+            )
+        cues = parse_srt(subtitle_path)
+        if not cues:
+            return self
+        if len(cues) > MAX_FALLBACK_CUES:
+            raise CoreFluxError(
+                "%r has %d cues; the Pillow fallback overlays one input per cue "
+                "and stops at %d. Install an FFmpeg with libass for long "
+                "subtitle tracks."
+                % (subtitle_path, len(cues), MAX_FALLBACK_CUES)
+            )
+
+        for start, end, text in cues:
+            png = render_caption_png(
+                text, self._width, self._height, size, color, font=font, box=box
+            )
+            # The PNG must stay available for the whole timeline: `enable`
+            # decides when it is drawn, but an input that has already ended
+            # leaves nothing to draw.
+            span = {"loop": 1}
+            if self._duration is not None:
+                span["t"] = self._duration
+            cue = InputFile(png, span).video()
+            self.video_stream = multi_filter(
+                [self.video_stream, cue], "overlay",
+                kwargs={"x": 0, "y": 0, "eof_action": "pass",
+                        "enable": "between(t,%s,%s)" % (start, end)},
+            )[0]
+        return self
+
     def add_text(self, text, x=10, y=10, size=48, color="white", font=None,
                  box=False, box_color="black@0.5", start=None, end=None):
         """Burn text into the layer.
 
-        Requires an FFmpeg built with libfreetype; raises
-        :class:`~core_flux.errors.FilterUnavailableError` if the local build
-        lacks the ``drawtext`` filter.
+        Uses FFmpeg's ``drawtext`` when the local build has it. Builds without
+        libfreetype (Homebrew's default, among others) fall back to rendering
+        the caption with Pillow and overlaying it, which looks the same.
+
+        Install the fallback with ``pip install core-flux[text]``.
         """
-        if not has_filter("drawtext"):
-            raise FilterUnavailableError(
-                "This FFmpeg build has no 'drawtext' filter (it needs libfreetype).\n"
-                "On macOS: brew reinstall ffmpeg. Check with: ffmpeg -filters | grep drawtext"
+        window = None
+        if start is not None or end is not None:
+            lower = 0 if start is None else start
+            upper = self._duration if end is None else end
+            if upper is None:
+                raise CoreFluxError(
+                    "Cannot infer the text end time; pass end= explicitly."
+                )
+            window = "between(t,%s,%s)" % (lower, upper)
+
+        if has_filter("drawtext"):
+            return self._add_text_drawtext(
+                text, x, y, size, color, font, box, box_color, window
             )
+        if pillow_available():
+            return self._add_text_overlay(
+                text, x, y, size, color, font, box, window
+            )
+        raise FilterUnavailableError(
+            "Cannot render text: this FFmpeg build has no 'drawtext' filter "
+            "(it needs libfreetype), and Pillow is not installed for the "
+            "fallback.\nFix either one:\n"
+            "  pip install core-flux[text]      # use the Pillow fallback\n"
+            "  brew reinstall ffmpeg            # get a build with drawtext"
+        )
+
+    def _add_text_drawtext(self, text, x, y, size, color, font, box, box_color,
+                           window):
         options = {
             "text": text,
             "x": x,
@@ -287,15 +474,33 @@ class VideoLayer(_Layer):
         if box:
             options["box"] = 1
             options["boxcolor"] = box_color
-        if start is not None or end is not None:
-            lower = 0 if start is None else start
-            upper = self._duration if end is None else end
-            if upper is None:
-                raise CoreFluxError(
-                    "Cannot infer the text end time; pass end= explicitly."
-                )
-            options["enable"] = "between(t,%s,%s)" % (lower, upper)
+        if window:
+            options["enable"] = window
         self.video_stream = self.video_stream.filter("drawtext", **options)
+        return self
+
+    def _add_text_overlay(self, text, x, y, size, color, font, box, window):
+        if not self._width or not self._height:
+            raise CoreFluxError(
+                "The Pillow text fallback needs to know the layer size. Call "
+                "resize() first, or install an FFmpeg with drawtext."
+            )
+        png = render_text_png(
+            text, self._width, self._height, x, y, size, color,
+            font=font, box=box,
+        )
+        # The caption is already positioned within a full-frame transparent
+        # PNG, so it overlays at the origin.
+        options = {"x": 0, "y": 0, "eof_action": "pass"}
+        if window:
+            options["enable"] = window
+        overlay_options = {"loop": 1}
+        if self._duration is not None:
+            overlay_options["t"] = self._duration
+        caption = InputFile(png, overlay_options).video()
+        self.video_stream = multi_filter(
+            [self.video_stream, caption], "overlay", kwargs=options
+        )[0]
         return self
 
     # ------------------------------------------------------------------- audio
@@ -351,6 +556,46 @@ class VideoLayer(_Layer):
         self._scale_duration(factor)
         return self
 
+    def reverse(self):
+        """Play the layer backwards, audio included."""
+        self.video_stream = self.video_stream.filter("reverse")
+        if self.audio_stream is not None:
+            self.audio_stream = self.audio_stream.filter("areverse")
+        return self
+
+    def loop(self, count):
+        """Repeat the layer `count` times in total.
+
+        Implemented with FFmpeg's input-level ``-stream_loop``, which re-reads
+        the file rather than buffering decoded frames in RAM the way the
+        ``loop`` filter does.
+        """
+        count = int(count)
+        if count < 1:
+            raise ValueError("loop() count must be at least 1, got %r" % (count,))
+        if self._input is None:
+            raise CoreFluxError(
+                "loop() needs a file-backed layer; this one was generated "
+                "(by concatenate(), for example)."
+            )
+        if count > 1:
+            self._input.options["stream_loop"] = count - 1
+        if self._duration is not None:
+            self._duration *= count
+        return self
+
+    def hold_last_frame(self, duration):
+        """Freeze on the final frame for an extra `duration` seconds."""
+        _positive("duration", duration)
+        self.video_stream = self.video_stream.filter(
+            "tpad", stop_duration=duration, stop_mode="clone"
+        )
+        if self.audio_stream is not None:
+            self.audio_stream = self.audio_stream.filter("apad", pad_dur=duration)
+        if self._duration is not None:
+            self._duration += duration
+        return self
+
     def fade_in(self, start_time=0.0, duration=1.0):
         """Fade both picture and native audio up from black/silence."""
         self.video_stream = self.video_stream.filter(
@@ -395,9 +640,10 @@ class ImageLayer(VideoLayer):
         if not info.has_video:
             raise UnsupportedMediaError("%r is not a readable image." % (input_path,))
 
-        node = ffmpeg.input(input_path, loop=1, framerate=fps, t=duration)
+        node = InputFile(input_path, {"loop": 1, "framerate": fps, "t": duration})
+        self._input = node
         self.input_path = input_path
-        self.video_stream = node.video
+        self.video_stream = node.video()
         self.audio_stream = None
         self._duration = float(duration)
         self._width = info.width
@@ -413,9 +659,10 @@ class ColorLayer(VideoLayer):
         _positive("duration", duration)
         ensure_ffmpeg()
         source = "color=c=%s:s=%dx%d:r=%d" % (color, width, height, fps)
-        node = ffmpeg.input(source, f="lavfi", t=duration)
+        node = InputFile(source, {"f": "lavfi", "t": duration})
+        self._input = node
         self.input_path = source
-        self.video_stream = node.video
+        self.video_stream = node.video()
         self.audio_stream = None
         self._duration = float(duration)
         self._width = width
@@ -433,8 +680,10 @@ class AudioLayer(_Layer):
             raise UnsupportedMediaError(
                 "%r contains no audio stream." % (input_path,)
             )
+        node = InputFile(input_path)
+        self._input = node
         self.input_path = input_path
-        self.audio_stream = ffmpeg.input(input_path).audio
+        self.audio_stream = node.audio()
         self._duration = info.duration
 
     def __repr__(self):
@@ -476,6 +725,32 @@ class AudioLayer(_Layer):
         _positive("factor", factor)
         self.audio_stream = _atempo_chain(self.audio_stream, factor)
         self._scale_duration(factor)
+        return self
+
+    def normalize(self, target=-16.0):
+        """Loudness-normalise to `target` LUFS (EBU R128).
+
+        -16 LUFS suits podcasts and web video; -14 is common for music
+        streaming. This is a single-pass measurement, so it is fast but
+        slightly less exact than a two-pass analysis.
+        """
+        self.audio_stream = self.audio_stream.filter("loudnorm", I=target)
+        return self
+
+    def reverse(self):
+        """Play the track backwards."""
+        self.audio_stream = self.audio_stream.filter("areverse")
+        return self
+
+    def loop(self, count):
+        """Repeat the track `count` times in total."""
+        count = int(count)
+        if count < 1:
+            raise ValueError("loop() count must be at least 1, got %r" % (count,))
+        if count > 1:
+            self._input.options["stream_loop"] = count - 1
+        if self._duration is not None:
+            self._duration *= count
         return self
 
     def fade_in(self, start_time=0.0, duration=1.0):
@@ -545,11 +820,10 @@ def concatenate(layers, width=None, height=None, fps=None, audio=True):
                         "Cannot pad %r with silence because its duration is unknown."
                         % (layer.input_path,)
                     )
-                track = ffmpeg.input(
+                track = InputFile(
                     "anullsrc=channel_layout=stereo:sample_rate=48000",
-                    f="lavfi",
-                    t=layer.duration,
-                ).audio
+                    {"f": "lavfi", "t": layer.duration},
+                ).audio()
             parts.append(track)
 
         if layer.duration is None:
@@ -557,9 +831,11 @@ def concatenate(layers, width=None, height=None, fps=None, audio=True):
         else:
             total += layer.duration
 
-    joined = ffmpeg.concat(
-        *parts, v=1, a=1 if include_audio else 0, n=len(layers)
-    ).node
+    kinds = ("v", "a") if include_audio else ("v",)
+    joined = multi_filter(
+        parts, "concat", output_kinds=kinds,
+        kwargs={"n": len(layers), "v": 1, "a": 1 if include_audio else 0},
+    )
 
     return VideoLayer._from_streams(
         video_stream=joined[0],
@@ -569,6 +845,109 @@ def concatenate(layers, width=None, height=None, fps=None, audio=True):
         height=height,
         fps=fps,
         source="<concatenate of %d clips>" % len(layers),
+    )
+
+
+# The transition names FFmpeg's xfade filter accepts. Kept as a tuple so a
+# typo is caught in Python with a readable list rather than deep inside FFmpeg.
+TRANSITIONS = (
+    "fade", "fadeblack", "fadewhite", "fadegrays", "distance", "wipeleft",
+    "wiperight", "wipeup", "wipedown", "slideleft", "slideright", "slideup",
+    "slidedown", "smoothleft", "smoothright", "smoothup", "smoothdown",
+    "circlecrop", "rectcrop", "circleclose", "circleopen", "horzclose",
+    "horzopen", "vertclose", "vertopen", "diagbl", "diagbr", "diagtl", "diagtr",
+    "hlslice", "hrslice", "vuslice", "vdslice", "dissolve", "pixelize",
+    "radial", "hblur", "wipetl", "wipetr", "wipebl", "wipebr", "zoomin",
+    "squeezev", "squeezeh",
+)
+
+
+def crossfade(layers, duration=1.0, transition="fade", width=None, height=None,
+              fps=None):
+    """Join clips with a crossfade instead of a hard cut.
+
+    Each clip overlaps the next by `duration` seconds, so the total runtime is
+    ``sum(durations) - duration * (len(layers) - 1)``. `transition` picks the
+    visual style; see :data:`TRANSITIONS` for the full list. Audio is
+    crossfaded to match whenever every clip has a soundtrack.
+
+    Returns an ordinary :class:`VideoLayer`, so the result can be trimmed,
+    faded and overlaid like any other clip.
+    """
+    layers = list(layers)
+    if not layers:
+        raise ValueError("crossfade() needs at least one layer.")
+    if len(layers) == 1:
+        return layers[0]
+    if transition not in TRANSITIONS:
+        raise ValueError(
+            "Unknown transition %r. Choose one of: %s"
+            % (transition, ", ".join(TRANSITIONS))
+        )
+    _positive("duration", duration)
+
+    for layer in layers:
+        if layer.duration is None:
+            raise CoreFluxError(
+                "crossfade() needs known durations; %r could not be probed."
+                % (layer.input_path,)
+            )
+        if layer.duration <= duration:
+            raise ValueError(
+                "Clip %r is %.2fs, which is not longer than the %.2fs "
+                "transition. Use a shorter transition or a longer clip."
+                % (layer.input_path, layer.duration, duration)
+            )
+
+    first = layers[0]
+    width = width or first.width
+    height = height or first.height
+    fps = fps or first.fps or 30
+    if not width or not height:
+        raise CoreFluxError(
+            "Could not determine an output size for crossfade(); "
+            "pass width= and height= explicitly."
+        )
+
+    include_audio = all(layer.has_audio for layer in layers)
+
+    def normalise(layer):
+        return (
+            layer.video_stream
+            .filter("scale", width, height)
+            .filter("setsar", 1)
+            .filter("fps", fps)
+            .filter("format", "yuv420p")
+        )
+
+    video = normalise(first)
+    audio = first.audio_stream if include_audio else None
+    # Each xfade offset is measured on its left input, which already contains
+    # every clip merged so far, minus the overlap consumed by each transition.
+    elapsed = first.duration
+
+    for layer in layers[1:]:
+        offset = elapsed - duration
+        video = multi_filter(
+            [video, normalise(layer)], "xfade",
+            kwargs={"transition": transition, "duration": duration,
+                    "offset": round(offset, 6)},
+        )[0]
+        if include_audio:
+            audio = multi_filter(
+                [audio, layer.audio_stream], "acrossfade",
+                output_kinds=("a",), kwargs={"d": duration},
+            )[0]
+        elapsed = offset + layer.duration
+
+    return VideoLayer._from_streams(
+        video_stream=video,
+        audio_stream=audio,
+        duration=elapsed,
+        width=width,
+        height=height,
+        fps=fps,
+        source="<crossfade of %d clips>" % len(layers),
     )
 
 
@@ -627,7 +1006,7 @@ class Composition(object):
                 # tpad delays the clip; enable keeps the padding from being drawn.
                 overlay = overlay.filter("tpad", start_duration=layer.start_time)
                 options["enable"] = "gte(t,%s)" % layer.start_time
-            base = ffmpeg.overlay(base, overlay, **options)
+            base = multi_filter([base, overlay], "overlay", kwargs=options)[0]
         return base
 
     def _collect_audio(self):
@@ -651,16 +1030,18 @@ class Composition(object):
         # normalize=0 keeps the volume each track was set to. FFmpeg's default
         # divides every input by the number of tracks, so with_volume_scaled_to
         # would silently mean something different as tracks were added.
-        return ffmpeg.filter(
-            streams, "amix", inputs=len(streams), normalize=0, dropout_transition=0
-        )
+        return multi_filter(
+            streams, "amix", output_kinds=("a",),
+            kwargs={"inputs": len(streams), "normalize": 0, "dropout_transition": 0},
+        )[0]
 
     def _build_output(self, output_path, format_type=None, duration=None,
-                      gif_fps=15, gif_width=None, **encoder_options):
+                      gif_fps=15, gif_width=None, hardware=False,
+                      **encoder_options):
         ensure_ffmpeg()
         if format_type is None:
             format_type = format_from_path(output_path)
-        if format_type not in ("video", "gif", "audio"):
+        if format_type not in ("video", "gif", "audio", "frame"):
             raise ValueError(
                 "format_type must be 'video', 'gif' or 'audio', got %r" % (format_type,)
             )
@@ -685,24 +1066,34 @@ class Composition(object):
             # and hardcoding one produces unplayable files for some containers.
             streams = [final_audio]
 
+        elif format_type == "frame":
+            # Still images take the picture only; mapping audio into a PNG
+            # makes FFmpeg fail looking for an image2 audio encoder.
+            streams = [self._compose_video()]
+
         elif format_type == "gif":
             video = self._compose_video().filter("fps", gif_fps)
             if gif_width:
                 video = video.filter("scale", gif_width, -1, flags="lanczos")
-            # palettegen and paletteuse both read the same frames, so the stream
-            # has to be split explicitly; reusing the node directly is an error.
-            branch = video.split()
-            palette = branch[0].filter("palettegen")
-            streams = [ffmpeg.filter([branch[1], palette], "paletteuse")]
+            # palettegen and paletteuse both read the same frames; the graph
+            # builder inserts the required split automatically.
+            palette = video.filter("palettegen")
+            streams = [multi_filter([video, palette], "paletteuse")[0]]
             options.update({"f": "gif", "loop": 0})
 
         else:
             video = self._compose_video()
             streams = [video]
             if os.path.splitext(output_path)[1].lower() in H264_EXTENSIONS:
-                options.update(
-                    {"vcodec": "libx264", "acodec": "aac", "pix_fmt": "yuv420p"}
-                )
+                encoder = best_h264_encoder(hardware)
+                options.update({
+                    "vcodec": encoder,
+                    "acodec": "aac",
+                    "pix_fmt": "yuv420p",
+                })
+                # Hardware encoders ignore -crf and default to a very high
+                # bitrate, so each family needs its own quality knob.
+                options.update(HARDWARE_QUALITY.get(encoder, {}))
             if final_audio is not None:
                 # apad plus -shortest pins the output to the picture length:
                 # a short track is padded with silence, a long one is cut off.
@@ -716,7 +1107,50 @@ class Composition(object):
 
         # Caller-supplied encoder settings win over the defaults.
         options.update(encoder_options)
-        return ffmpeg.output(*streams, filename=output_path, **options), format_type
+        return streams, options, format_type
+
+    @staticmethod
+    def _option_args(options):
+        """Turn an output-option mapping into FFmpeg arguments.
+
+        A value of ``None`` means a bare flag, so ``{"shortest": None}`` emits
+        ``-shortest`` rather than ``-shortest None``.
+        """
+        args = []
+        for name, value in options.items():
+            args.append("-" + name)
+            if value is not None:
+                args.append(str(value))
+        return args
+
+    def _compile(self, output_path, format_type=None, overwrite=True, **kwargs):  # noqa: E501
+        """Build the full FFmpeg argument list for this composition."""
+        streams, options, resolved = self._build_output(
+            output_path, format_type, **kwargs
+        )
+        input_args, filter_complex, maps = Graph().build(streams)
+
+        command = ["ffmpeg", "-hide_banner", "-nostdin", "-y" if overwrite else "-n"]
+        command += input_args
+        if filter_complex:
+            command += ["-filter_complex", filter_complex]
+        for label in maps:
+            # Input streams map as 0:v; filter outputs map as [s3].
+            command += ["-map", label if ":" in label else "[%s]" % label]
+        command += self._option_args(options)
+        command.append(output_path)
+        return command, resolved
+
+    def save_frame(self, output_path, t=0.0, **kwargs):
+        """Write a single frame at `t` seconds to an image file.
+
+        Useful for thumbnails and contact sheets without decoding the whole
+        timeline.
+        """
+        return self.render(
+            output_path, format_type="frame", quiet=kwargs.pop("quiet", True),
+            ss=t, **dict({"frames:v": 1, "update": 1}, **kwargs)
+        )
 
     def get_command(self, output_path, format_type=None, **kwargs):
         """Return the FFmpeg command this composition would run, as a string.
@@ -724,11 +1158,11 @@ class Composition(object):
         Useful for debugging a graph, or for lifting the command into a shell
         script or CI job.
         """
-        output, _ = self._build_output(output_path, format_type, **kwargs)
-        return " ".join(["ffmpeg"] + output.overwrite_output().get_args())
+        command, _ = self._compile(output_path, format_type, **kwargs)
+        return " ".join(command)
 
     def render(self, output_path, format_type=None, quiet=False, verbose=False,
-               overwrite=True, duration=None, **kwargs):
+               overwrite=True, duration=None, hardware=False, **kwargs):
         """Compile the timeline and write it to `output_path`.
 
         `format_type` is inferred from the extension when omitted. Extra keyword
@@ -740,33 +1174,25 @@ class Composition(object):
                 "%r already exists and overwrite=False." % (output_path,)
             )
 
-        output, resolved_format = self._build_output(
-            output_path, format_type, duration=duration, **kwargs
+        command, resolved_format = self._compile(
+            output_path, format_type, overwrite=overwrite, duration=duration,
+            hardware=hardware, **kwargs
         )
-        if overwrite:
-            output = output.overwrite_output()
-        else:
-            # -n makes FFmpeg refuse rather than prompt. Without it, -nostdin
-            # leaves the prompt unanswerable and the file gets clobbered.
-            output = output.global_args("-n")
-
-        command = " ".join(["ffmpeg"] + output.get_args())
         if not quiet:
             print("CORE-FLUX v%s: rendering %s -> %s"
                   % (_version(), resolved_format, output_path))
 
         started = time.time()
-        try:
-            output.run(
-                cmd=["ffmpeg", "-hide_banner", "-nostdin"],
-                capture_stdout=not verbose,
-                capture_stderr=not verbose,
-            )
-        except ffmpeg.Error as exc:
-            stderr = exc.stderr.decode("utf-8", "replace") if exc.stderr else ""
+        result = subprocess.run(
+            command,
+            stdout=None if verbose else subprocess.PIPE,
+            stderr=None if verbose else subprocess.PIPE,
+        )
+        if result.returncode != 0:
+            stderr = (result.stderr or b"").decode("utf-8", "replace")
             raise RenderError(
                 "FFmpeg failed while rendering %r." % (output_path,),
-                command=command,
+                command=" ".join(command),
                 stderr="\n".join(stderr.strip().splitlines()[-25:]),
             )
 

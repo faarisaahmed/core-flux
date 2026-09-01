@@ -9,7 +9,7 @@ import os
 import shutil
 import subprocess
 
-import ffmpeg
+import json
 
 from .errors import FFmpegNotFoundError, MediaNotFoundError, UnsupportedMediaError
 
@@ -106,7 +106,19 @@ def _parse_rate(value):
 
 @functools.lru_cache(maxsize=256)
 def _probe_raw(path, mtime, size):
-    return ffmpeg.probe(path)
+    """Run ffprobe and return its parsed JSON. Cached per (path, mtime, size)."""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_format", "-show_streams",
+         "-of", "json", path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    if result.returncode != 0:
+        raise UnsupportedMediaError(
+            "FFmpeg could not read %r. It may be corrupt or not a media file.\n%s"
+            % (path, result.stderr.decode("utf-8", "replace").strip())
+        )
+    return json.loads(result.stdout.decode("utf-8", "replace"))
 
 
 def inspect_media(path):
@@ -120,14 +132,7 @@ def inspect_media(path):
         raise MediaNotFoundError("No such media file: %r" % (path,))
 
     stat = os.stat(path)
-    try:
-        raw = _probe_raw(os.path.abspath(path), stat.st_mtime, stat.st_size)
-    except ffmpeg.Error as exc:
-        detail = exc.stderr.decode("utf-8", "replace").strip() if exc.stderr else ""
-        raise UnsupportedMediaError(
-            "FFmpeg could not read %r. It may be corrupt or not a media file.\n%s"
-            % (path, detail)
-        )
+    raw = _probe_raw(os.path.abspath(path), stat.st_mtime, stat.st_size)
 
     streams = raw.get("streams", [])
     video = next((s for s in streams if s.get("codec_type") == "video"), None)
@@ -150,3 +155,44 @@ def inspect_media(path):
         has_video=video is not None,
         has_audio=audio is not None,
     )
+
+
+@functools.lru_cache(maxsize=1)
+def available_encoders():
+    """Return the set of encoder names this FFmpeg build supports."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+
+    names = set()
+    for line in result.stdout.decode("utf-8", "replace").splitlines():
+        parts = line.split()
+        # Rows look like: " V....D h264_videotoolbox  VideoToolbox H.264 Encoder"
+        if len(parts) >= 2 and len(parts[0]) == 6 and parts[0][0] in "VAS":
+            names.add(parts[1])
+    return frozenset(names)
+
+
+# Hardware H.264 encoders, best-supported first.
+_HARDWARE_H264 = (
+    "h264_videotoolbox",  # Apple Silicon / macOS
+    "h264_nvenc",         # NVIDIA
+    "h264_qsv",           # Intel Quick Sync
+    "h264_amf",           # AMD
+)
+
+
+def best_h264_encoder(hardware=True):
+    """Pick an H.264 encoder, preferring hardware when one is available."""
+    if hardware:
+        encoders = available_encoders()
+        for name in _HARDWARE_H264:
+            if name in encoders:
+                return name
+    return "libx264"
