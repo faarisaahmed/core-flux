@@ -15,6 +15,9 @@ Two workloads are measured:
                out. This is the workload the library is actually built for.
   transition - join three segments with crossfades. Both libraries support
                this, so it is a like-for-like comparison.
+  frames     - apply a custom per-pixel NumPy effect to every frame. This is
+               MoviePy's home turf: neither engine can express it as a filter,
+               so both decode to Python and re-encode.
 
 core-flux is measured twice: with the default software encoder, and with
 hardware=True where a hardware H.264 encoder is available.
@@ -191,6 +194,33 @@ def moviepy_composite(output):
         clip.close()
 
 
+def flux_frames(output):
+    from core_flux import VideoLayer
+
+    def invert_red(frame):
+        frame[:, :, 0] = 255 - frame[:, :, 0]
+        return frame
+
+    layer = VideoLayer(SAMPLE).resize(1280, 720)
+    layer.apply_frame_function(invert_red, output_path=output)
+
+
+def moviepy_frames(output):
+    from moviepy import VideoFileClip
+    from moviepy.video.fx import Resize
+
+    def invert_red(frame):
+        frame = frame.copy()
+        frame[:, :, 0] = 255 - frame[:, :, 0]
+        return frame
+
+    clip = VideoFileClip(SAMPLE).with_effects([Resize(new_size=(1280, 720))])
+    transformed = clip.image_transform(invert_red)
+    transformed.write_videofile(output, codec="libx264", audio=False, logger=None)
+    clip.close()
+    transformed.close()
+
+
 def hardware_variant(fn):
     """Run a core-flux workload with hardware encoding enabled."""
     def wrapped(output):
@@ -228,6 +258,10 @@ WORKLOADS = [
         "core-flux": flux_transition,
         "core-flux+hw": hardware_variant(flux_transition),
         "moviepy": moviepy_transition,
+    }),
+    ("frames (custom per-pixel NumPy effect)", {
+        "core-flux": flux_frames,
+        "moviepy": moviepy_frames,
     }),
 ]
 

@@ -101,7 +101,7 @@ def test_silent_file_rejected_as_audio_layer(media):
     lambda layer: layer.trim(5, 2),
     lambda layer: layer.set_start(-1),
     lambda layer: layer.speed(0),
-    lambda layer: layer.rotate(45),
+    lambda layer: layer.flip("sideways"),
     lambda layer: layer.flip("diagonal"),
     lambda layer: layer.set_opacity(1.5),
 ])
@@ -144,6 +144,14 @@ def test_subclip_defaults_to_end_of_clip(media):
 def test_set_start_shifts_the_end_marker(media):
     layer = VideoLayer(media["cam"]).set_start(2)
     assert layer.end == pytest.approx(5.0, abs=0.1)
+
+
+def test_arbitrary_rotation_is_supported(media, out):
+    """Angles other than 90/180/270 use the general rotate filter."""
+    command = Composition(
+        layers=[VideoLayer(media["bg"]).resize(320, 180).rotate(45)]
+    ).get_command(out("r.mp4"))
+    assert "rotate=" in command and "transpose" not in command
 
 
 def test_resize_and_rotate_update_reported_size(media):

@@ -196,3 +196,27 @@ def best_h264_encoder(hardware=True):
             if name in encoders:
                 return name
     return "libx264"
+
+
+def measure_volume(audio_stream):
+    """Decode an audio stream and return its mean/max volume in dBFS."""
+    from .graph import Graph
+
+    input_args, filter_complex, maps = Graph().build([audio_stream])
+    command = ["ffmpeg", "-hide_banner", "-nostdin"] + input_args
+    if filter_complex:
+        command += ["-filter_complex", filter_complex]
+    label = maps[0]
+    command += ["-map", label if ":" in label else "[%s]" % label]
+    command += ["-af", "volumedetect", "-f", "null", "-"]
+
+    result = subprocess.run(command, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE)
+    readings = {}
+    for line in result.stderr.decode("utf-8", "replace").splitlines():
+        for key in ("mean_volume", "max_volume"):
+            if key + ":" in line:
+                readings[key] = float(line.split(key + ":")[1].split("dB")[0])
+    if not readings:
+        raise UnsupportedMediaError("Could not measure the volume of this track.")
+    return readings

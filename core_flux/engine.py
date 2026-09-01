@@ -5,14 +5,19 @@ executed until :meth:`Composition.render`, which compiles the whole timeline
 into a single FFmpeg invocation.
 """
 
+import atexit
 import os
+import shutil
 import subprocess
+import tempfile
 import time
 import warnings
 
+from .frames import FrameWriter, iter_frames
 from .graph import Graph, InputFile, multi_filter
 from .errors import (
     CoreFluxError,
+    FFmpegNotFoundError,
     FilterUnavailableError,
     MediaNotFoundError,
     RenderError,
@@ -42,6 +47,16 @@ H264_EXTENSIONS = frozenset([".mp4", ".m4v", ".mov", ".mkv", ".ts", ".flv"])
 # The Pillow subtitle fallback adds one FFmpeg input per cue, so it only suits
 # short tracks. Past this, a libass build is the right answer.
 MAX_FALLBACK_CUES = 100
+
+# Scratch directories holding frames materialised by apply_frame_function.
+# Cleaned up when the process exits.
+_TEMP_DIRS = []
+
+
+@atexit.register
+def _clean_temp_dirs():
+    for directory in _TEMP_DIRS:
+        shutil.rmtree(directory, ignore_errors=True)
 
 # Quality defaults per hardware encoder; none of them accept -crf, and each
 # vendor exposes a different knob. The VideoToolbox value was calibrated by
@@ -109,6 +124,8 @@ class _Layer(object):
         # every subclass get consistent defaults.
         self.x_pos = 0
         self.y_pos = 0
+        # An FFmpeg `enable` expression gating when this layer is drawn.
+        self._enable = None
 
     @property
     def duration(self):
@@ -240,8 +257,13 @@ class VideoLayer(_Layer):
         self._width, self._height = width, height
         return self
 
-    def rotate(self, degrees):
-        """Rotate clockwise. 90/180/270 use the lossless transpose filter."""
+    def rotate(self, degrees, fill="black"):
+        """Rotate clockwise.
+
+        90/180/270 use the lossless transpose filter; any other angle uses the
+        general rotate filter, which grows the frame and fills the corners with
+        `fill`.
+        """
         turns = int(degrees) % 360
         if turns == 0:
             return self
@@ -251,9 +273,16 @@ class VideoLayer(_Layer):
             if turns in (90, 270):
                 self._width, self._height = self._height, self._width
             return self
-        raise ValueError(
-            "rotate() supports 0, 90, 180 or 270 degrees, got %r" % (degrees,)
+        # Arbitrary angles need the general rotate filter, which resizes the
+        # frame to fit and fills the corners.
+        radians = "%s*PI/180" % float(degrees)
+        self.video_stream = self.video_stream.filter(
+            "rotate", radians,
+            ow="rotw(%s)" % radians, oh="roth(%s)" % radians,
+            fillcolor=fill,
         )
+        self._width = self._height = None  # now depends on the angle
+        return self
 
     def flip(self, axis="horizontal"):
         """Mirror the layer across 'horizontal' or 'vertical'."""
@@ -339,6 +368,53 @@ class VideoLayer(_Layer):
         if self._width and self._height:
             self._width += left + right
             self._height += top + bottom
+        return self
+
+    def even_size(self):
+        """Round the frame up to even dimensions, which H.264 requires."""
+        self.video_stream = self.video_stream.filter(
+            "pad", "ceil(iw/2)*2", "ceil(ih/2)*2"
+        )
+        if self._width:
+            self._width += self._width % 2
+        if self._height:
+            self._height += self._height % 2
+        return self
+
+    def multiply_color(self, factor):
+        """Scale every colour channel. Above 1.0 brightens, below darkens."""
+        _positive("factor", factor)
+        self.video_stream = self.video_stream.filter(
+            "colorchannelmixer", rr=factor, gg=factor, bb=factor
+        )
+        return self
+
+    def supersample(self, frames=5):
+        """Average neighbouring frames, for a soft motion-blurred look."""
+        frames = int(frames)
+        if frames < 2:
+            raise ValueError("supersample() needs at least 2 frames, got %r"
+                             % (frames,))
+        self.video_stream = self.video_stream.filter("tmix", frames=frames)
+        return self
+
+    def scroll(self, horizontal=0.0, vertical=0.0):
+        """Scroll the picture. Speeds are fractions of the frame per frame."""
+        self.video_stream = self.video_stream.filter(
+            "scroll", horizontal=horizontal, vertical=vertical
+        )
+        return self
+
+    def blink(self, on_duration, off_duration):
+        """Show the layer for `on_duration`, hide it for `off_duration`, repeat.
+
+        Only meaningful for an overlay layer; the base canvas has nothing to
+        blink against.
+        """
+        _positive("on_duration", on_duration)
+        _positive("off_duration", off_duration)
+        cycle = on_duration + off_duration
+        self._enable = "lt(mod(t,%s),%s)" % (cycle, on_duration)
         return self
 
     def chroma_key(self, color="green", similarity=0.3, blend=0.1):
@@ -503,6 +579,177 @@ class VideoLayer(_Layer):
         )[0]
         return self
 
+    # ------------------------------------------------------------------- masks
+
+    def to_mask(self):
+        """Convert the picture to greyscale, for use as a mask."""
+        self.video_stream = self.video_stream.filter("format", "gray")
+        return self
+
+    def with_mask(self, mask_layer):
+        """Apply a greyscale layer as this layer's alpha channel.
+
+        White areas of the mask stay opaque, black becomes transparent.
+        """
+        mask = mask_layer.video_stream.filter("format", "gray")
+        self.video_stream = multi_filter(
+            [self.video_stream.filter("format", "yuva420p"), mask], "alphamerge"
+        )[0]
+        return self
+
+    def mask_and(self, other):
+        """Intersect two masks: opaque only where both are."""
+        self.video_stream = multi_filter(
+            [self.video_stream, other.video_stream], "blend",
+            kwargs={"all_mode": "darken"},
+        )[0]
+        return self
+
+    def mask_or(self, other):
+        """Union two masks: opaque where either is."""
+        self.video_stream = multi_filter(
+            [self.video_stream, other.video_stream], "blend",
+            kwargs={"all_mode": "lighten"},
+        )[0]
+        return self
+
+    def freeze_region(self, t, x, y, width, height):
+        """Freeze a rectangle of the picture at time `t`, leaving the rest live."""
+        if self._duration is None:
+            raise CoreFluxError("freeze_region() needs a known duration.")
+        step = 1.0 / (self._fps or 30)
+        still = (self.video_stream
+                 .filter("trim", start=t, end=t + step)
+                 .filter("setpts", "PTS-STARTPTS")
+                 .filter("crop", width, height, x, y)
+                 .filter("tpad", stop_duration=self._duration,
+                         stop_mode="clone"))
+        self.video_stream = multi_filter(
+            [self.video_stream, still], "overlay",
+            kwargs={"x": x, "y": y, "eof_action": "pass"},
+        )[0]
+        return self
+
+    # ---------------------------------------------------------- motion presets
+
+    def slide_in(self, duration=1.0, side="left"):
+        """Slide the layer in from an edge over `duration` seconds."""
+        self.set_position(*self._slide_expression(duration, side, entering=True))
+        return self
+
+    def slide_out(self, duration=1.0, side="left"):
+        """Slide the layer out to an edge over the final `duration` seconds."""
+        self.set_position(*self._slide_expression(duration, side, entering=False))
+        return self
+
+    def _slide_expression(self, duration, side, entering):
+        _positive("duration", duration)
+        if side not in ("left", "right", "top", "bottom"):
+            raise ValueError(
+                "side must be 'left', 'right', 'top' or 'bottom', got %r" % (side,)
+            )
+        x, y = self.x_pos, self.y_pos
+        if entering:
+            progress = "min(1,t/%s)" % duration
+        else:
+            if self._duration is None:
+                raise CoreFluxError("slide_out() needs a known duration.")
+            begin = max(0.0, self._duration - duration)
+            progress = "1-min(1,max(0,(t-%s)/%s))" % (begin, duration)
+
+        if side == "left":
+            return ("(%s)*(%s)-(1-(%s))*w" % (progress, x, progress), y)
+        if side == "right":
+            return ("(%s)*(%s)+(1-(%s))*W" % (progress, x, progress), y)
+        if side == "top":
+            return (x, "(%s)*(%s)-(1-(%s))*h" % (progress, y, progress))
+        return (x, "(%s)*(%s)+(1-(%s))*H" % (progress, y, progress))
+
+    # ------------------------------------------------------------ raw frames
+
+    def iter_frames(self, width=None, height=None, fps=None, pix_fmt="rgb24",
+                    as_numpy=True):
+        """Stream this layer's frames into Python.
+
+        Yields ``(height, width, channels)`` NumPy arrays, or ``bytes`` when
+        `as_numpy` is False. Read-only, streaming, and memory-flat.
+        """
+        width = width or self._width
+        height = height or self._height
+        if not width or not height:
+            raise CoreFluxError(
+                "iter_frames() needs a frame size. Call resize() first, or "
+                "pass width= and height=."
+            )
+        # Skip the safety rescale when the layer is already that size.
+        already = (width == self._width and height == self._height)
+        return iter_frames(self.video_stream, width, height, fps=fps,
+                           pix_fmt=pix_fmt, as_numpy=as_numpy,
+                           scale=not already)
+
+    def get_frame(self, t=0.0, width=None, height=None, pix_fmt="rgb24",
+                  as_numpy=True):
+        """Return a single frame at `t` seconds."""
+        clone = self.copy().trim(t, t + 1.0 / (self._fps or 30))
+        for frame in clone.iter_frames(width or self._width,
+                                       height or self._height,
+                                       pix_fmt=pix_fmt, as_numpy=as_numpy):
+            return frame
+        raise CoreFluxError("No frame found at t=%r." % (t,))
+
+    def apply_frame_function(self, function, width=None, height=None, fps=None,
+                             pix_fmt="rgb24", as_numpy=True, output_path=None,
+                             **encoder_options):
+        """Run `function` over every frame and return the result as a new layer.
+
+        This is the escape hatch: the filtergraph cannot express arbitrary
+        Python, so the clip is decoded to raw frames, transformed, and
+        re-encoded to a temporary file. The returned layer behaves like any
+        other, so you can keep editing it.
+
+        Audio is carried across untouched. Pass `output_path` to keep the
+        result somewhere permanent instead of a scratch file.
+        """
+        width = width or self._width
+        height = height or self._height
+        if not width or not height:
+            raise CoreFluxError(
+                "apply_frame_function() needs a frame size. Call resize() "
+                "first, or pass width= and height=."
+            )
+        fps = fps or self._fps or 30
+
+        if output_path:
+            target = output_path
+        else:
+            directory = tempfile.mkdtemp(prefix="coreflux_frames_")
+            target = os.path.join(directory, "transformed.mp4")
+            _TEMP_DIRS.append(directory)
+
+        writer = FrameWriter(target, width, height, fps=fps, pix_fmt=pix_fmt,
+                             **encoder_options)
+        with writer:
+            for frame in self.iter_frames(width, height, fps=fps,
+                                          pix_fmt=pix_fmt, as_numpy=as_numpy):
+                writer.write(function(frame))
+
+        result = VideoLayer(target)
+        # The transform only touched the picture; keep the original sound.
+        result.audio_stream = self.audio_stream
+        result.start_time = self.start_time
+        result.x_pos, result.y_pos = self.x_pos, self.y_pos
+        return result
+
+    def copy(self):
+        """A shallow copy sharing the same graph nodes, safe to edit separately.
+
+        Filters are immutable once built, so the copy can be chained without
+        disturbing the original.
+        """
+        import copy as _copy
+
+        return _copy.copy(self)
+
     # ------------------------------------------------------------------- audio
 
     def with_volume_scaled_to(self, factor):
@@ -596,6 +843,180 @@ class VideoLayer(_Layer):
             self._duration += duration
         return self
 
+    def cut_out(self, start, end):
+        """Remove a section from the middle, joining what remains."""
+        if end <= start:
+            raise ValueError("cut_out() end must exceed start.")
+        if self._duration is None:
+            raise CoreFluxError("cut_out() needs a known duration.")
+        head_v = self._segment_video(0, start)
+        tail_v = self._segment_video(end, self._duration)
+        self.video_stream = multi_filter(
+            [head_v, tail_v], "concat", kwargs={"n": 2, "v": 1, "a": 0}
+        )[0]
+        if self.audio_stream is not None:
+            head_a = self._segment_audio(0, start)
+            tail_a = self._segment_audio(end, self._duration)
+            self.audio_stream = multi_filter(
+                [head_a, tail_a], "concat", output_kinds=("a",),
+                kwargs={"n": 2, "v": 0, "a": 1},
+            )[0]
+        self._duration -= (end - start)
+        return self
+
+    def _segment_video(self, start, end):
+        return (self.video_stream
+                .filter("trim", start=start, end=end)
+                .filter("setpts", "PTS-STARTPTS"))
+
+    def _segment_audio(self, start, end):
+        return (self.audio_stream
+                .filter("atrim", start=start, end=end)
+                .filter("asetpts", "PTS-STARTPTS"))
+
+    def time_symmetrize(self):
+        """Play the clip forwards then backwards, so it ends where it began."""
+        forward = self.video_stream
+        backward = self.video_stream.filter("reverse")
+        self.video_stream = multi_filter(
+            [forward, backward], "concat", kwargs={"n": 2, "v": 1, "a": 0}
+        )[0]
+        if self.audio_stream is not None:
+            self.audio_stream = multi_filter(
+                [self.audio_stream, self.audio_stream.filter("areverse")],
+                "concat", output_kinds=("a",), kwargs={"n": 2, "v": 0, "a": 1},
+            )[0]
+        if self._duration is not None:
+            self._duration *= 2
+        return self
+
+    def freeze(self, t, duration):
+        """Pause on the frame at `t` for `duration` seconds, then carry on."""
+        _positive("duration", duration)
+        if self._duration is None:
+            raise CoreFluxError("freeze() needs a known duration.")
+        if not 0 <= t <= self._duration:
+            raise ValueError("freeze() time %r is outside the clip." % (t,))
+        step = 1.0 / (self._fps or 30)
+
+        head = self._segment_video(0, max(step, t))
+        still = (self._segment_video(t, t + step)
+                 .filter("tpad", stop_duration=duration, stop_mode="clone"))
+        tail = self._segment_video(t, self._duration)
+        self.video_stream = multi_filter(
+            [head, still, tail], "concat", kwargs={"n": 3, "v": 1, "a": 0}
+        )[0]
+        # A frozen picture has no matching sound, so the audio is dropped.
+        self.audio_stream = None
+        self._duration += duration
+        return self
+
+    def accel_decel(self, new_duration=None, strength=1.0):
+        """Ease the clip in and out of motion instead of playing at one rate.
+
+        `strength` blends between linear (0.0) and a full smoothstep curve
+        (1.0). Audio is dropped, because a continuously varying rate is not
+        expressible as an audio filter.
+        """
+        if self._duration is None:
+            raise CoreFluxError("accel_decel() needs a known duration.")
+        if not 0.0 <= strength <= 1.0:
+            raise ValueError("strength must be between 0.0 and 1.0.")
+        target = float(new_duration or self._duration)
+        _positive("new_duration", target)
+
+        source = self._duration
+        # Map input time T onto a smoothstep curve over the new duration.
+        progress = "(T/%s)" % source
+        smooth = "pow(%s,2)*(3-2*%s)" % (progress, progress)
+        curve = "((1-%s)*%s+%s*%s)" % (strength, progress, strength, smooth)
+        self.video_stream = self.video_stream.filter(
+            "setpts", "%s*%s/TB" % (target, curve)
+        )
+        self.audio_stream = None
+        self._duration = target
+        return self
+
+    def make_loopable(self, overlap=1.0):
+        """Crossfade the clip's ending into its own opening so it loops cleanly."""
+        _positive("overlap", overlap)
+        if self._duration is None:
+            raise CoreFluxError("make_loopable() needs a known duration.")
+        if overlap >= self._duration:
+            raise ValueError(
+                "overlap %.2fs must be shorter than the %.2fs clip."
+                % (overlap, self._duration)
+            )
+        head = (self.video_stream
+                .filter("trim", start=0, end=overlap)
+                .filter("setpts", "PTS-STARTPTS"))
+        self.video_stream = multi_filter(
+            [self.video_stream, head], "xfade",
+            kwargs={"transition": "fade", "duration": overlap,
+                    "offset": round(self._duration - overlap, 6)},
+        )[0]
+        return self
+
+    def to_image_layer(self, t=0.0, duration=5.0):
+        """Freeze a single frame into a still :class:`ImageLayer`-style layer."""
+        step = 1.0 / (self._fps or 30)
+        still = (self.video_stream
+                 .filter("trim", start=t, end=t + step)
+                 .filter("setpts", "PTS-STARTPTS")
+                 .filter("tpad", stop_duration=duration, stop_mode="clone"))
+        return VideoLayer._from_streams(
+            video_stream=still, audio_stream=None, duration=duration,
+            width=self._width, height=self._height, fps=self._fps,
+            source="<frame of %s at %ss>" % (self.input_path, t),
+        )
+
+    def set_audio(self, audio_layer):
+        """Replace this layer's sound with a separate track."""
+        self.audio_stream = audio_layer.audio_stream
+        return self
+
+    @property
+    def aspect_ratio(self):
+        if not self._width or not self._height:
+            return None
+        return self._width / float(self._height)
+
+    @property
+    def n_frames(self):
+        if self._duration is None or not self._fps:
+            return None
+        return int(round(self._duration * self._fps))
+
+    def set_duration(self, duration):
+        """Trim or pad the layer to exactly `duration` seconds."""
+        _positive("duration", duration)
+        self.video_stream = (
+            self.video_stream
+            .filter("tpad", stop_duration=duration, stop_mode="clone")
+            .filter("trim", duration=duration)
+            .filter("setpts", "PTS-STARTPTS")
+        )
+        if self.audio_stream is not None:
+            self.audio_stream = (
+                self.audio_stream
+                .filter("apad")
+                .filter("atrim", duration=duration)
+                .filter("asetpts", "PTS-STARTPTS")
+            )
+        self._duration = float(duration)
+        return self
+
+    def set_end(self, end):
+        """Set where this layer stops on the timeline."""
+        return self.set_duration(end - self.start_time)
+
+    def set_fps(self, fps):
+        """Resample to a given frame rate."""
+        _positive("fps", fps)
+        self.video_stream = self.video_stream.filter("fps", fps)
+        self._fps = fps
+        return self
+
     def fade_in(self, start_time=0.0, duration=1.0):
         """Fade both picture and native audio up from black/silence."""
         self.video_stream = self.video_stream.filter(
@@ -670,6 +1091,90 @@ class ColorLayer(VideoLayer):
         self._fps = fps
 
 
+class ImageSequenceLayer(VideoLayer):
+    """A folder of numbered stills played as video.
+
+    `pattern` is either a printf sequence (``frames/%04d.png``) or a glob
+    (``frames/*.png``).
+    """
+
+    def __init__(self, pattern, fps=30):
+        _Layer.__init__(self)
+        _positive("fps", fps)
+        ensure_ffmpeg()
+
+        if "%" in pattern:
+            options = {"framerate": fps}
+            count = _count_printf_sequence(pattern)
+        else:
+            import glob as _glob
+
+            matches = sorted(_glob.glob(pattern))
+            if not matches:
+                raise MediaNotFoundError("No images match %r." % (pattern,))
+            options = {"framerate": fps, "pattern_type": "glob"}
+            count = len(matches)
+            first = matches[0]
+
+        if "%" in pattern:
+            first = _first_printf_match(pattern)
+            if first is None:
+                raise MediaNotFoundError("No images match %r." % (pattern,))
+
+        info = inspect_media(first)
+        node = InputFile(pattern, options)
+        self._input = node
+        self.input_path = pattern
+        self.video_stream = node.video()
+        self.audio_stream = None
+        self._duration = count / float(fps)
+        self._width = info.width
+        self._height = info.height
+        self._fps = fps
+
+
+class TextLayer(VideoLayer):
+    """A caption on its own transparent canvas, ready to overlay."""
+
+    def __init__(self, text, width, height, duration=5.0, x=10, y=10, size=48,
+                 color="white", font=None, box=False, box_color="black@0.5",
+                 background="black@0.0", fps=30):
+        _Layer.__init__(self)
+        _positive("duration", duration)
+        ensure_ffmpeg()
+
+        source = "color=c=%s:s=%dx%d:r=%d" % (background, width, height, fps)
+        node = InputFile(source, {"f": "lavfi", "t": duration})
+        self._input = node
+        self.input_path = "<text %r>" % (text,)
+        # rgba keeps the canvas transparent so only the glyphs composite.
+        self.video_stream = node.video().filter("format", "rgba")
+        self.audio_stream = None
+        self._duration = float(duration)
+        self._width = width
+        self._height = height
+        self._fps = fps
+
+        self.add_text(text, x=x, y=y, size=size, color=color, font=font,
+                      box=box, box_color=box_color)
+
+
+def _first_printf_match(pattern):
+    import glob as _glob
+    import re
+
+    globbed = re.sub(r"%0?\d*d", "*", pattern)
+    matches = sorted(_glob.glob(globbed))
+    return matches[0] if matches else None
+
+
+def _count_printf_sequence(pattern):
+    import glob as _glob
+    import re
+
+    return len(_glob.glob(re.sub(r"%0?\d*d", "*", pattern)))
+
+
 class AudioLayer(_Layer):
     """A standalone audio track, such as music or a sound effect."""
 
@@ -685,6 +1190,17 @@ class AudioLayer(_Layer):
         self.input_path = input_path
         self.audio_stream = node.audio()
         self._duration = info.duration
+
+    @classmethod
+    def _from_stream(cls, audio_stream, duration, source="<generated>"):
+        """Build a track around an existing graph node (used by generators)."""
+        track = object.__new__(cls)
+        _Layer.__init__(track)
+        track._input = None
+        track.input_path = source
+        track.audio_stream = audio_stream
+        track._duration = duration
+        return track
 
     def __repr__(self):
         return "<AudioLayer %r %ss>" % (self.input_path, self._duration)
@@ -741,6 +1257,39 @@ class AudioLayer(_Layer):
         """Play the track backwards."""
         self.audio_stream = self.audio_stream.filter("areverse")
         return self
+
+    def delay(self, seconds=0.5, decay=0.5):
+        """Add an echo: one repeat after `seconds`, at `decay` of the volume."""
+        _positive("seconds", seconds)
+        self.audio_stream = self.audio_stream.filter(
+            "aecho", 0.8, 0.9, int(seconds * 1000), decay
+        )
+        return self
+
+    def with_stereo_volume(self, left=1.0, right=1.0):
+        """Scale the left and right channels independently."""
+        self.audio_stream = self.audio_stream.filter(
+            "pan", "stereo|c0=%s*c0|c1=%s*c1" % (left, right)
+        )
+        return self
+
+    def set_duration(self, duration):
+        """Trim or pad the track to exactly `duration` seconds."""
+        _positive("duration", duration)
+        self.audio_stream = (
+            self.audio_stream
+            .filter("apad")
+            .filter("atrim", duration=duration)
+            .filter("asetpts", "PTS-STARTPTS")
+        )
+        self._duration = float(duration)
+        return self
+
+    def max_volume(self):
+        """Peak volume in dBFS, measured by decoding the track."""
+        from .probe import measure_volume
+
+        return measure_volume(self.audio_stream)["max_volume"]
 
     def loop(self, count):
         """Repeat the track `count` times in total."""
@@ -951,6 +1500,86 @@ def crossfade(layers, duration=1.0, transition="fade", width=None, height=None,
     )
 
 
+def clips_array(rows, width=None, height=None, fps=None):
+    """Arrange layers in a grid, like a contact sheet or split screen.
+
+    `rows` is a list of rows, each a list of layers. Every cell is scaled to
+    the same size, so rows may differ in length but the grid stays aligned.
+    """
+    rows = [list(row) for row in rows if row]
+    if not rows:
+        raise ValueError("clips_array() needs at least one row.")
+
+    first = rows[0][0]
+    width = width or first.width
+    height = height or first.height
+    fps = fps or first.fps or 30
+    if not width or not height:
+        raise CoreFluxError(
+            "Could not determine a cell size for clips_array(); "
+            "pass width= and height= explicitly."
+        )
+
+    def cell(layer):
+        return (layer.video_stream
+                .filter("scale", width, height)
+                .filter("setsar", 1)
+                .filter("fps", fps))
+
+    stacked_rows = []
+    for row in rows:
+        cells = [cell(layer) for layer in row]
+        if len(cells) == 1:
+            stacked_rows.append(cells[0])
+        else:
+            stacked_rows.append(multi_filter(
+                cells, "hstack", kwargs={"inputs": len(cells)}
+            )[0])
+
+    if len(stacked_rows) == 1:
+        grid = stacked_rows[0]
+    else:
+        grid = multi_filter(
+            stacked_rows, "vstack", kwargs={"inputs": len(stacked_rows)}
+        )[0]
+
+    columns = max(len(row) for row in rows)
+    durations = [layer.duration for row in rows for layer in row]
+    total = None if any(d is None for d in durations) else max(durations)
+
+    return VideoLayer._from_streams(
+        video_stream=grid, audio_stream=None, duration=total,
+        width=width * columns, height=height * len(rows), fps=fps,
+        source="<clips_array %dx%d>" % (columns, len(rows)),
+    )
+
+
+def concatenate_audio(tracks):
+    """Join audio tracks end to end into a single :class:`AudioLayer`."""
+    tracks = list(tracks)
+    if not tracks:
+        raise ValueError("concatenate_audio() needs at least one track.")
+    if len(tracks) == 1:
+        return tracks[0]
+
+    parts = [
+        track.audio_stream.filter(
+            "aformat", sample_rates=48000, channel_layouts="stereo"
+        )
+        for track in tracks
+    ]
+    joined = multi_filter(
+        parts, "concat", output_kinds=("a",),
+        kwargs={"n": len(tracks), "v": 0, "a": 1},
+    )[0]
+
+    durations = [track.duration for track in tracks]
+    total = None if any(d is None for d in durations) else sum(durations)
+    return AudioLayer._from_stream(
+        joined, total, "<concatenate of %d tracks>" % len(tracks)
+    )
+
+
 class Composition(object):
     """The timeline. Layers stack bottom-up; the first one is the canvas.
 
@@ -1002,10 +1631,16 @@ class Composition(object):
                 # default of 'repeat' would freeze its last frame on screen.
                 "eof_action": "pass",
             }
+            gates = []
             if layer.start_time > 0:
                 # tpad delays the clip; enable keeps the padding from being drawn.
                 overlay = overlay.filter("tpad", start_duration=layer.start_time)
-                options["enable"] = "gte(t,%s)" % layer.start_time
+                gates.append("gte(t,%s)" % layer.start_time)
+            if layer._enable:
+                gates.append(layer._enable)
+            if gates:
+                options["enable"] = gates[0] if len(gates) == 1 else \
+                    "*".join("(%s)" % g for g in gates)
             base = multi_filter([base, overlay], "overlay", kwargs=options)[0]
         return base
 
@@ -1151,6 +1786,74 @@ class Composition(object):
             output_path, format_type="frame", quiet=kwargs.pop("quiet", True),
             ss=t, **dict({"frames:v": 1, "update": 1}, **kwargs)
         )
+
+    def save_frames(self, pattern, fps=1, **kwargs):
+        """Write frames as numbered images, e.g. ``"frames/%04d.png"``.
+
+        `fps` controls how many frames per second are written, so `fps=1` gives
+        one image per second of footage.
+        """
+        if "%" not in pattern:
+            raise ValueError(
+                "save_frames() needs a printf pattern such as 'frames/%04d.png'."
+            )
+        directory = os.path.dirname(pattern)
+        if directory and not os.path.isdir(directory):
+            os.makedirs(directory)
+        return self.render(
+            pattern, format_type="frame", quiet=kwargs.pop("quiet", True),
+            r=fps, **kwargs
+        )
+
+    def iter_frames(self, width=None, height=None, fps=None, pix_fmt="rgb24",
+                    as_numpy=True):
+        """Stream the composed timeline's frames into Python."""
+        if not self.layers:
+            raise CoreFluxError("iter_frames() needs at least one video layer.")
+        base = self.layers[0]
+        width = width or base.width
+        height = height or base.height
+        if not width or not height:
+            raise CoreFluxError(
+                "iter_frames() needs a frame size. Pass width= and height=."
+            )
+        return iter_frames(self._compose_video(), width, height, fps=fps,
+                           pix_fmt=pix_fmt, as_numpy=as_numpy)
+
+    def preview(self, **kwargs):
+        """Play the composition with ffplay instead of writing a file.
+
+        Blocks until the window is closed. Requires ffplay, which ships with
+        most FFmpeg builds.
+        """
+        if shutil.which("ffplay") is None:
+            raise FFmpegNotFoundError(
+                "ffplay was not found on your PATH; it usually ships with FFmpeg."
+            )
+        streams, _, _ = self._build_output("preview.mkv", "video", **kwargs)
+        input_args, filter_complex, maps = Graph().build(streams)
+        # ffplay cannot take a filter_complex, so FFmpeg renders the graph to a
+        # pipe and ffplay just plays the stream.
+        command = ["ffmpeg", "-hide_banner", "-v", "error", "-nostdin"]
+        command += input_args
+        if filter_complex:
+            command += ["-filter_complex", filter_complex]
+        for label in maps:
+            command += ["-map", label if ":" in label else "[%s]" % label]
+        command += ["-f", "matroska", "-c:v", "libx264", "-preset", "ultrafast",
+                    "-c:a", "pcm_s16le", "-"]
+
+        render = subprocess.Popen(command, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL)
+        player = subprocess.Popen(
+            ["ffplay", "-hide_banner", "-loglevel", "error", "-autoexit", "-"],
+            stdin=render.stdout, stderr=subprocess.DEVNULL,
+        )
+        render.stdout.close()
+        player.wait()
+        render.terminate()
+        render.wait()
+        return self
 
     def get_command(self, output_path, format_type=None, **kwargs):
         """Return the FFmpeg command this composition would run, as a string.

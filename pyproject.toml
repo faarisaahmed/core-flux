@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "core-flux"
-version = "0.5.0"
+version = "0.6.0"
 description = "A fast, layer-based video editing library built on native FFmpeg filtergraphs."
 readme = "README.md"
 requires-python = ">=3.8"
@@ -33,12 +33,15 @@ dependencies = []
 [project.optional-dependencies]
 # Pillow powers the text fallback for FFmpeg builds without libfreetype.
 text = ["pillow>=9.0"]
-dev = ["pytest>=7.0", "pillow>=9.0"]
+# NumPy makes raw frame access ergonomic; without it frames come back as bytes.
+frames = ["numpy>=1.20"]
+all = ["pillow>=9.0", "numpy>=1.20"]
+dev = ["pytest>=7.0", "pillow>=9.0", "numpy>=1.20"]
 
 [project.urls]
-Homepage = "https://github.com/Faaris/core-flux"
-Source = "https://github.com/Faaris/core-flux"
-Issues = "https://github.com/Faaris/core-flux/issues"
+Homepage = "https://github.com/faarisaahmed/core-flux"
+Source = "https://github.com/faarisaahmed/core-flux"
+Issues = "https://github.com/faarisaahmed/core-flux/issues"
 
 # Both packages ship: core_flux is the real module, fastvideo is the
 # deprecated 0.3.x alias that forwards to it.

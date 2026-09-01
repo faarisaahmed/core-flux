@@ -6,10 +6,15 @@ from .engine import (
     ColorLayer,
     Composition,
     ImageLayer,
+    ImageSequenceLayer,
+    TextLayer,
     VideoLayer,
+    clips_array,
     concatenate,
+    concatenate_audio,
     crossfade,
 )
+from .frames import FrameWriter, numpy_available
 from .errors import (
     CoreFluxError,
     FFmpegNotFoundError,
@@ -20,16 +25,22 @@ from .errors import (
 )
 from .probe import inspect_media
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
     "VideoLayer",
     "AudioLayer",
     "ImageLayer",
+    "ImageSequenceLayer",
     "ColorLayer",
+    "TextLayer",
     "Composition",
     "concatenate",
+    "concatenate_audio",
     "crossfade",
+    "clips_array",
+    "FrameWriter",
+    "numpy_available",
     "TRANSITIONS",
     "inspect_media",
     "CoreFluxError",
