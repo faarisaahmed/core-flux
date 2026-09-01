@@ -1,17 +1,51 @@
 [build-system]
-requires = ["flit_core >=3.2,<4"]
-build-backend = "flit_core.buildapi"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "core-flux"
-version = "0.3.3"
-description = "A blazing fast video editing library wrapping FFmpeg native filters."
+version = "0.4.0"
+description = "A fast, layer-based video editing library built on native FFmpeg filtergraphs."
 readme = "README.md"
+requires-python = ">=3.8"
+license = {text = "MIT"}
 authors = [{name = "Faaris"}]
-classifiers = ["Programming Language :: Python :: 3"]
+keywords = ["video", "ffmpeg", "editing", "compositing", "moviepy", "audio", "gif"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Video :: Conversion",
+    "Topic :: Multimedia :: Sound/Audio",
+]
 dependencies = [
-    "ffmpeg-python>=0.2.0"
+    "ffmpeg-python>=0.2.0",
 ]
 
-[tool.flit.module]
-name = "fastvideo"
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+
+[project.urls]
+Homepage = "https://github.com/Faaris/core-flux"
+Source = "https://github.com/Faaris/core-flux"
+Issues = "https://github.com/Faaris/core-flux/issues"
+
+# Both packages ship: core_flux is the real module, fastvideo is the
+# deprecated 0.3.x alias that forwards to it.
+[tool.hatch.build.targets.wheel]
+packages = ["core_flux", "fastvideo"]
+
+[tool.hatch.build.targets.sdist]
+include = ["core_flux", "fastvideo", "tests", "benchmark", "README.md", "LICENSE"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

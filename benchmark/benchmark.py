@@ -1,111 +1,222 @@
-import time
+"""Benchmark core-flux against raw FFmpeg and MoviePy.
+
+Run it with no arguments; the fixture clips are generated on first use, so the
+numbers are reproducible on any machine with FFmpeg installed:
+
+    pip install moviepy
+    python benchmark/benchmark.py
+
+Two workloads are measured:
+
+  transcode  - scale 1080p to 720p and re-encode H.264/AAC. This is almost
+               pure FFmpeg encode time, so every engine should land close
+               together; it exists to show core-flux adds no overhead.
+  composite  - overlay a second clip, mute it, mix in a music bed and fade
+               out. This is the workload the library is actually built for.
+"""
+
 import os
-import subprocess
-import platform
 import statistics
+import subprocess
+import sys
+import time
 
-NUM_RUNS = 3  # Multiple iterations to remove statistical noise
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-def get_system_specs():
-    return {
-        "OS": f"{platform.system()} {platform.release()}",
-        "Architecture": platform.machine(),
-        "Processor": platform.processor() or "Unknown Processor",
-        "Python Version": platform.python_version()
-    }
+HERE = os.path.dirname(os.path.abspath(__file__))
+SAMPLE = os.path.join(HERE, "sample.mp4")
+OVERLAY = os.path.join(HERE, "overlay.mp4")
+MUSIC = os.path.join(HERE, "music.mp3")
+NUM_RUNS = 3
 
-def run_core_flux(input_file, output_file):
-    from fastvideo import VideoLayer, Composition
-    start = time.time()
-    clip = VideoLayer(input_file).resize(1280, 720)
-    comp = Composition(layers=[clip])
-    comp.render(output_file)
-    return time.time() - start
 
-def run_moviepy(input_file, output_file):
+def ffmpeg(args):
+    subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"] + args, check=True
+    )
+
+
+def build_fixtures():
+    """Generate any missing inputs. Existing files are never overwritten, so
+    dropping your own real footage in as sample.mp4 just works.
+
+    The synthetic source carries added noise and is capped at a realistic
+    ~8 Mbps. A clean synthetic pattern compresses so well that encoding costs
+    almost nothing, which flatters any engine that only wraps FFmpeg.
+    """
+    if not os.path.exists(SAMPLE):
+        print("Generating 1080p sample clip (no sample.mp4 found)...")
+        ffmpeg(["-f", "lavfi",
+                "-i", "testsrc2=size=1920x1080:rate=30:duration=15,"
+                      "noise=alls=14:allf=t",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=15",
+                "-c:v", "libx264", "-preset", "medium", "-pix_fmt", "yuv420p",
+                "-b:v", "8M", "-maxrate", "8M", "-bufsize", "16M",
+                "-c:a", "aac", "-shortest", SAMPLE])
+    if not os.path.exists(OVERLAY):
+        print("Generating overlay clip...")
+        ffmpeg(["-f", "lavfi",
+                "-i", "testsrc2=size=640x480:rate=30:duration=15,"
+                      "noise=alls=14:allf=t",
+                "-f", "lavfi", "-i", "sine=frequency=880:duration=15",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-b:v", "2M",
+                "-c:a", "aac", "-shortest", OVERLAY])
+    if not os.path.exists(MUSIC):
+        print("Generating music bed...")
+        ffmpeg(["-f", "lavfi", "-i", "sine=frequency=220:duration=20", MUSIC])
+
+
+# ------------------------------------------------------------------ transcode
+
+def flux_transcode(output):
+    from core_flux import Composition, VideoLayer
+
+    Composition(layers=[VideoLayer(SAMPLE).resize(1280, 720)]).render(
+        output, quiet=True
+    )
+
+
+def ffmpeg_transcode(output):
+    ffmpeg(["-i", SAMPLE, "-vf", "scale=1280:720", "-c:v", "libx264",
+            "-crf", "23", "-c:a", "aac", output])
+
+
+def moviepy_transcode(output):
     from moviepy import VideoFileClip
     from moviepy.video.fx import Resize
-    start = time.time()
-    clip = VideoFileClip(input_file)
-    resized_clip = clip.with_effects([Resize(new_size=(1280, 720))])
-    resized_clip.write_videofile(output_file, codec="libx264", audio_codec="aac", logger=None)
-    clip.close()
-    resized_clip.close()
-    return time.time() - start
 
-def run_raw_ffmpeg(input_file, output_file):
+    clip = VideoFileClip(SAMPLE)
+    resized = clip.with_effects([Resize(new_size=(1280, 720))])
+    resized.write_videofile(output, codec="libx264", audio_codec="aac", logger=None)
+    clip.close()
+    resized.close()
+
+
+# ------------------------------------------------------------------ composite
+
+def flux_composite(output):
+    from core_flux import AudioLayer, Composition, VideoLayer
+
+    base = VideoLayer(SAMPLE).resize(1280, 720).fade_out(duration=1.5)
+    overlay = VideoLayer(OVERLAY).resize(320, 240).set_position(40, 40).mute()
+    music = AudioLayer(MUSIC).with_volume_scaled_to(0.2)
+    Composition(layers=[base, overlay], audio_tracks=[music]).render(
+        output, quiet=True
+    )
+
+
+def ffmpeg_composite(output):
+    ffmpeg([
+        "-i", SAMPLE, "-i", OVERLAY, "-i", MUSIC,
+        "-filter_complex",
+        "[0:v]scale=1280:720,fade=t=out:st=13.5:d=1.5[base];"
+        "[1:v]scale=320:240[ov];"
+        "[base][ov]overlay=40:40:eof_action=pass[v];"
+        "[2:a]volume=0.2[m];"
+        "[0:a][m]amix=inputs=2:normalize=0:dropout_transition=0,apad[a]",
+        "-map", "[v]", "-map", "[a]", "-shortest",
+        "-c:v", "libx264", "-crf", "23", "-c:a", "aac", "-pix_fmt", "yuv420p",
+        output,
+    ])
+
+
+def moviepy_composite(output):
+    from moviepy import (
+        AudioFileClip, CompositeAudioClip, CompositeVideoClip, VideoFileClip,
+    )
+    from moviepy.audio.fx import MultiplyVolume
+    from moviepy.video.fx import FadeOut, Resize
+
+    base = VideoFileClip(SAMPLE).with_effects(
+        [Resize(new_size=(1280, 720)), FadeOut(1.5)]
+    )
+    overlay = (VideoFileClip(OVERLAY)
+               .with_effects([Resize(new_size=(320, 240))])
+               .with_position((40, 40))
+               .without_audio())
+    music = AudioFileClip(MUSIC).with_effects([MultiplyVolume(0.2)])
+    music = music.subclipped(0, base.duration)
+    composite = CompositeVideoClip([base, overlay])
+    composite.audio = CompositeAudioClip([base.audio, music])
+    composite.write_videofile(
+        output, codec="libx264", audio_codec="aac", logger=None
+    )
+    for clip in (base, overlay, music, composite):
+        clip.close()
+
+
+WORKLOADS = [
+    ("transcode (1080p -> 720p, H.264/AAC)", {
+        "ffmpeg": ffmpeg_transcode,
+        "core-flux": flux_transcode,
+        "moviepy": moviepy_transcode,
+    }),
+    ("composite (overlay + audio mix + fade)", {
+        "ffmpeg": ffmpeg_composite,
+        "core-flux": flux_composite,
+        "moviepy": moviepy_composite,
+    }),
+]
+
+
+def time_run(fn, output):
     start = time.time()
-    cmd = [
-        'ffmpeg', '-y', 
-        '-i', input_file, 
-        '-vf', 'scale=1280:720', 
-        '-c:v', 'libx264', 
-        '-crf', '23',          
-        '-c:a', 'aac', 
-        output_file
-    ]
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    return time.time() - start
+    fn(output)
+    elapsed = time.time() - start
+    if os.path.exists(output):
+        os.remove(output)
+    return elapsed
+
+
+def main():
+    build_fixtures()
+
+    import platform
+    print("-" * 75)
+    print("CORE-FLUX BENCHMARK")
+    print("-" * 75)
+    print("OS:         %s %s" % (platform.system(), platform.release()))
+    print("CPU arch:   %s" % platform.machine())
+    print("Python:     %s" % platform.python_version())
+    print("Input:      %s (%.2f MB)"
+          % (os.path.basename(SAMPLE), os.path.getsize(SAMPLE) / (1024 * 1024)))
+    print("Iterations: %d per engine, after one warmup" % NUM_RUNS)
+    print("-" * 75)
+
+    print("\nWarming the page cache...")
+    time_run(ffmpeg_transcode, os.path.join(HERE, "warmup.mp4"))
+
+    for title, engines in WORKLOADS:
+        results = {}
+        print("\nWorkload: %s" % title)
+        for name, fn in engines.items():
+            timings = []
+            for index in range(NUM_RUNS):
+                output = os.path.join(HERE, "bench_%s_%d.mp4" % (name.replace("-", ""), index))
+                try:
+                    timings.append(time_run(fn, output))
+                except Exception as exc:  # a missing engine shouldn't kill the run
+                    print("  %-12s skipped (%s)" % (name, exc))
+                    timings = []
+                    break
+            if timings:
+                results[name] = timings
+                print("  %-12s done" % name)
+
+        print("\n  %-12s | %-10s | %-10s | %-10s | %-8s"
+              % ("Engine", "Avg", "Min", "Max", "Std dev"))
+        print("  " + "-" * 63)
+        for name, data in results.items():
+            print("  %-12s | %8.2fs | %8.2fs | %8.2fs | %6.2fs"
+                  % (name, statistics.mean(data), min(data), max(data),
+                     statistics.stdev(data) if len(data) > 1 else 0.0))
+
+        if "moviepy" in results and "core-flux" in results:
+            ratio = statistics.mean(results["moviepy"]) / statistics.mean(results["core-flux"])
+            print("\n  core-flux is %.2fx the speed of MoviePy on this workload." % ratio)
+
+    print("\n" + "-" * 75)
+
 
 if __name__ == "__main__":
-    TEST_VIDEO = "sample.mp4"
-    
-    if not os.path.exists(TEST_VIDEO):
-        print(f"Error: '{TEST_VIDEO}' not found.")
-        exit(1)
-        
-    specs = get_system_specs()
-    print("-" * 60)
-    print("BENCHMARK TEST CONDITIONS & SYSTEM SPECS")
-    print("-" * 60)
-    print(f"OS:         {specs['OS']}")
-    print(f"CPU Arch:   {specs['Architecture']}")
-    print(f"Processor:  {specs['Processor']}")
-    print(f"Python:     {specs['Python Version']}")
-    print(f"Input File: {TEST_VIDEO} ({os.path.getsize(TEST_VIDEO) / (1024*1024):.2f} MB)")
-    print(f"Iterations: {NUM_RUNS} runs per contender (after 1 warmup run)")
-    print("-" * 60 + "\n")
-
-    # --- WARMUP RUN (To eliminate disk/cache noise) ---
-    print("Priming system cache with warmup run...")
-    _ = run_raw_ffmpeg(TEST_VIDEO, "warmup.mp4")
-    
-    results = {"ffmpeg": [], "core-flux": [], "moviepy": []}
-    
-    # --- BENCHMARK LOOP ---
-    for i in range(NUM_RUNS):
-        print(f"Executing Iteration {i+1}/{NUM_RUNS}...")
-        
-        # We alternate or clean up files to ensure identical disk environments
-        results["ffmpeg"].append(run_raw_ffmpeg(TEST_VIDEO, f"out_ffmpeg_{i}.mp4"))
-        results["core-flux"].append(run_core_flux(TEST_VIDEO, f"out_flux_{i}.mp4"))
-        results["moviepy"].append(run_moviepy(TEST_VIDEO, f"out_mpy_{i}.mp4"))
-
-    # --- CLEANUP BENCHMARK PRODUCTS ---
-    for i in range(NUM_RUNS):
-        for prefix in ["out_ffmpeg_", "out_flux_", "out_mpy_"]:
-            if os.path.exists(f"{prefix}{i}.mp4"):
-                os.remove(f"{prefix}{i}.mp4")
-    if os.path.exists("warmup.mp4"):
-        os.remove("warmup.mp4")
-
-    # --- STATISTICAL ANALYSIS & REPORT ---
-    print("\n" + "=" * 75)
-    print("   BENCHMARK SUMMARY REPORT (1080p Scaled H.264/AAC Export)")
-    print("=" * 75)
-    print(f"{'Engine':<18} | {'Avg Time':<12} | {'Min Time':<12} | {'Max Time':<12} | {'Std Dev':<10}")
-    print("-" * 75)
-    
-    for name, data in results.items():
-        avg_t = statistics.mean(data)
-        min_t = min(data)
-        max_t = max(data)
-        std_v = statistics.stdev(data) if len(data) > 1 else 0.0
-        print(f"{name:<18} | {avg_t:>10.2f}s | {min_t:>10.2f}s | {max_t:>10.2f}s | {std_v:>8.2f}s")
-        
-    print("=" * 75)
-    
-    mpy_avg = statistics.mean(results["moviepy"])
-    flux_avg = statistics.mean(results["core-flux"])
-    print(f"Conclusion: core-flux achieves a {mpy_avg / flux_avg:.2f}x speedup relative to MoviePy.")
-    print("=" * 75)
+    main()
